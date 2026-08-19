@@ -2,8 +2,10 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <ESPmDNS.h>
 #include <time.h>
 #include <math.h>
+#include "secrets.h"
 
 /*
   ESP32 + MAX485 + ADJ Saber Spot RGBW
@@ -35,11 +37,8 @@
 */
 
 // -----------------------------------------------------------------------------
-// Wi-Fi：自分の値へ書き換える。パスワードを共有するときは必ず伏せる。
+// Wi-Fi設定は secrets.h に分離する。
 // -----------------------------------------------------------------------------
-
-const char* WIFI_SSID = "IODATA-b0c620-2G";
-const char* WIFI_PASSWORD = "7218236646609";
 
 WebServer server(80);
 
@@ -86,14 +85,73 @@ int mode = 1;
 // weather: 0=Sunny, 1=Cloudy, 2=Rain
 int weather = 0;
 
+// GPIO25 = 5V fan control (via external MOSFET)
+constexpr int FAN_PIN = 25;
+constexpr int FAN_PWM_CHANNEL = 0;
+constexpr int FAN_PWM_FREQUENCY = 50;
+constexpr int FAN_PWM_RESOLUTION = 8;
+constexpr uint8_t FAN_DEFAULT_SPEED = 0;
+uint8_t fanSpeed = FAN_DEFAULT_SPEED;
+
+// GPIO26 = 5V dosing pump control (via external MOSFET)
+constexpr int DOSING_PIN = 26;
+constexpr uint32_t DOSING_MAX_RUN_MS = 10000;
+constexpr uint32_t DOSING_STEP_MS = 500;
+constexpr uint32_t DOSING_DEFAULT_MS = 3000;
+
+bool dosingActive = false;
+uint32_t dosingStartedMs = 0;
+uint32_t dosingStopMs = 0;
+uint32_t dosingDurationMs = DOSING_DEFAULT_MS;
+
 String phase = "手動";
 String timeStr = "--:--";
 
-uint32_t lastDmxMs = 0;
-uint32_t lastTimeMs = 0;
-uint32_t lastLightMs = 0;
+constexpr uint8_t MAX_SAVED_NETWORKS = 5;
+constexpr uint32_t WIFI_RECONNECT_RETRY_MS = 45000;
+constexpr uint8_t WIFI_SETUP_AP_CHANNEL = 1;
+const char* SETUP_AP_SSID = "Paludarium-Setup";
+const char* SETUP_AP_PASSWORD = "paludarium";
+const char* HOSTNAME = "paludarium";
+
+struct SavedNetwork {
+  String ssid;
+  String password;
+};
+
+SavedNetwork savedNetworks[MAX_SAVED_NETWORKS];
+uint8_t savedNetworkCount = 0;
+bool apMode = false;
+bool wifiConnected = false;
+String currentWifiSsid = "";
+int currentWifiRssi = 0;
+String currentIp = "";
 uint32_t lastWifiRetryMs = 0;
+uint32_t lastSavedScanMs = 0;
 wl_status_t previousWifiStatus = WL_IDLE_STATUS;
+
+struct ScanResult {
+  String ssid;
+  int32_t rssi;
+  bool secure;
+};
+
+enum WifiState {
+  WIFI_STATE_IDLE,
+  WIFI_STATE_SCAN_START,
+  WIFI_STATE_SCANNING,
+  WIFI_STATE_SELECT_NETWORK,
+  WIFI_STATE_CONNECTING,
+  WIFI_STATE_CONNECTED,
+  WIFI_STATE_FAILED
+};
+
+WifiState wifiState = WIFI_STATE_IDLE;
+String wifiConnectSsid = "";
+String wifiConnectPass = "";
+String wifiScanJsonCache = "[]";
+bool wifiScanPending = false;
+uint32_t wifiStateChangedMs = 0;
 
 // -----------------------------------------------------------------------------
 // DMX処理
@@ -317,7 +375,8 @@ void loadSettings() {
   const bool hasSavedValues = preferences.isKey("mode") || preferences.isKey("weather") ||
                               preferences.isKey("manual_r") || preferences.isKey("manual_g") ||
                               preferences.isKey("manual_b") || preferences.isKey("manual_w") ||
-                              preferences.isKey("manual_d");
+                              preferences.isKey("manual_d") || preferences.isKey("fan_speed") ||
+                              preferences.isKey("dosing_ms");
 
   if (hasSavedValues) {
     mode = preferences.getUChar("mode", mode);
@@ -327,6 +386,8 @@ void loadSettings() {
     blue = preferences.getUChar("manual_b", blue);
     white = preferences.getUChar("manual_w", white);
     masterDimmer = preferences.getUChar("manual_d", masterDimmer);
+    fanSpeed = preferences.getUChar("fan_speed", fanSpeed);
+    dosingDurationMs = preferences.getULong("dosing_ms", dosingDurationMs);
   }
 
   preferences.end();
@@ -349,18 +410,295 @@ void saveSettings() {
   preferences.putUChar("manual_b", blue);
   preferences.putUChar("manual_w", white);
   preferences.putUChar("manual_d", masterDimmer);
+  preferences.putUChar("fan_speed", fanSpeed);
+  preferences.putULong("dosing_ms", dosingDurationMs);
   preferences.end();
 
   settingsDirty = false;
+}
+
+void updateFanOutput() {
+  const uint16_t duty = map(fanSpeed, 0, 100, 0, 255);
+  ledcWrite(FAN_PIN, duty);
+}
+
+void setFanSpeed(uint8_t speed) {
+  fanSpeed = constrain(speed, 0, 100);
+  updateFanOutput();
+  markSettingsDirty();
+}
+
+void setupFan() {
+  pinMode(FAN_PIN, OUTPUT);
+  digitalWrite(FAN_PIN, LOW);
+
+  ledcAttach(FAN_PIN, FAN_PWM_FREQUENCY, FAN_PWM_RESOLUTION);
+  ledcWrite(FAN_PIN, 0);
+
+  preferences.begin("paludarium", false);
+  const bool hasSavedFanSpeed = preferences.isKey("fan_speed");
+  if (hasSavedFanSpeed) {
+    fanSpeed = preferences.getUChar("fan_speed", FAN_DEFAULT_SPEED);
+  } else {
+    fanSpeed = FAN_DEFAULT_SPEED;
+  }
+  preferences.end();
+
+  updateFanOutput();
+}
+
+void setupDosing() {
+  pinMode(DOSING_PIN, OUTPUT);
+  digitalWrite(DOSING_PIN, LOW);
+  dosingActive = false;
+  dosingStartedMs = 0;
+  dosingStopMs = 0;
+  // 再起動時は設定時間だけ復元し、ポンプは必ず OFF で開始する。
+}
+
+bool startDosing(uint32_t ms) {
+  if (ms < DOSING_STEP_MS || ms > DOSING_MAX_RUN_MS) {
+    return false;
+  }
+
+  if ((ms % DOSING_STEP_MS) != 0) {
+    return false;
+  }
+
+  dosingDurationMs = ms;
+  dosingStartedMs = millis();
+  dosingStopMs = dosingStartedMs + ms;
+  dosingActive = true;
+  digitalWrite(DOSING_PIN, HIGH);
+  return true;
+}
+
+void stopDosing() {
+  dosingActive = false;
+  dosingStartedMs = 0;
+  dosingStopMs = 0;
+  digitalWrite(DOSING_PIN, LOW);
+}
+
+void updateDosing() {
+  // Wi‑Fi切断時でも DMX 送信を継続し、ドージングは指定時間の自動停止のみ行う。
+  if (!dosingActive) {
+    return;
+  }
+
+  if ((millis() - dosingStartedMs) >= dosingDurationMs) {
+    stopDosing();
+  }
+}
+
+uint32_t getDosingRemainingMs() {
+  if (!dosingActive) {
+    return 0;
+  }
+
+  uint32_t elapsed = millis() - dosingStartedMs;
+  if (elapsed >= dosingDurationMs) {
+    return 0;
+  }
+
+  return dosingDurationMs - elapsed;
 }
 
 // -----------------------------------------------------------------------------
 // Web API
 // -----------------------------------------------------------------------------
 
+void loadSavedNetworks() {
+  savedNetworkCount = 0;
+  preferences.begin("paludarium", false);
+  const uint8_t count = preferences.getUChar("wifi_count", 0);
+  for (uint8_t i = 0; i < MAX_SAVED_NETWORKS && i < count; ++i) {
+    const String keySsid = "wifi_ssid_" + String(i);
+    const String keyPass = "wifi_pass_" + String(i);
+    if (preferences.isKey(keySsid.c_str()) && preferences.isKey(keyPass.c_str())) {
+      savedNetworks[savedNetworkCount].ssid = preferences.getString(keySsid.c_str(), "");
+      savedNetworks[savedNetworkCount].password = preferences.getString(keyPass.c_str(), "");
+      if (savedNetworks[savedNetworkCount].ssid.length() > 0) {
+        savedNetworkCount++;
+      }
+    }
+  }
+  preferences.end();
+}
+
+void saveNetwork(const String& ssid, const String& password) {
+  if (ssid.length() == 0) return;
+
+  preferences.begin("paludarium", false);
+  const uint8_t existingCount = preferences.getUChar("wifi_count", 0);
+  for (uint8_t i = 0; i < existingCount; ++i) {
+    const String keySsid = "wifi_ssid_" + String(i);
+    if (preferences.getString(keySsid.c_str(), "") == ssid) {
+      preferences.putString(("wifi_pass_" + String(i)).c_str(), password);
+      preferences.end();
+      loadSavedNetworks();
+      return;
+    }
+  }
+
+  if (existingCount < MAX_SAVED_NETWORKS) {
+    const uint8_t index = existingCount;
+    preferences.putString(("wifi_ssid_" + String(index)).c_str(), ssid);
+    preferences.putString(("wifi_pass_" + String(index)).c_str(), password);
+    preferences.putUChar("wifi_count", existingCount + 1);
+  } else {
+    // 5件上限。最も古いものを置き換える。
+    for (uint8_t i = 1; i < MAX_SAVED_NETWORKS; ++i) {
+      const String keySsid = "wifi_ssid_" + String(i);
+      const String prevKeySsid = "wifi_ssid_" + String(i - 1);
+      const String keyPass = "wifi_pass_" + String(i);
+      const String prevKeyPass = "wifi_pass_" + String(i - 1);
+      preferences.putString(prevKeySsid.c_str(), preferences.getString(keySsid.c_str(), ""));
+      preferences.putString(prevKeyPass.c_str(), preferences.getString(keyPass.c_str(), ""));
+    }
+    preferences.putString(("wifi_ssid_" + String(MAX_SAVED_NETWORKS - 1)).c_str(), ssid);
+    preferences.putString(("wifi_pass_" + String(MAX_SAVED_NETWORKS - 1)).c_str(), password);
+    preferences.putUChar("wifi_count", MAX_SAVED_NETWORKS);
+  }
+  preferences.end();
+  loadSavedNetworks();
+}
+
+void deleteNetworkByIndex(uint8_t index) {
+  if (index >= savedNetworkCount) return;
+
+  preferences.begin("paludarium", false);
+  const uint8_t count = preferences.getUChar("wifi_count", 0);
+  for (uint8_t i = index; i < count - 1; ++i) {
+    preferences.putString(("wifi_ssid_" + String(i)).c_str(), preferences.getString(("wifi_ssid_" + String(i + 1)).c_str(), ""));
+    preferences.putString(("wifi_pass_" + String(i)).c_str(), preferences.getString(("wifi_pass_" + String(i + 1)).c_str(), ""));
+  }
+  preferences.putString(("wifi_ssid_" + String(count - 1)).c_str(), "");
+  preferences.putString(("wifi_pass_" + String(count - 1)).c_str(), "");
+  preferences.putUChar("wifi_count", count > 0 ? count - 1 : 0);
+  preferences.end();
+  loadSavedNetworks();
+}
+
+String buildScanJson() {
+  const int found = WiFi.scanComplete();
+  if (found <= 0) {
+    return "[]";
+  }
+
+  struct UniqueWifiEntry {
+    String ssid;
+    int32_t rssi;
+    bool secure;
+  };
+
+  UniqueWifiEntry unique[32];
+  uint8_t uniqueCount = 0;
+
+  for (int i = 0; i < found; ++i) {
+    const String ssid = WiFi.SSID(i);
+    if (ssid.length() == 0) continue;
+
+    int matchIndex = -1;
+    for (uint8_t j = 0; j < uniqueCount; ++j) {
+      if (unique[j].ssid == ssid) {
+        matchIndex = j;
+        break;
+      }
+    }
+
+    const int32_t rssi = WiFi.RSSI(i);
+    const bool secure = WiFi.encryptionType(i) != WIFI_AUTH_OPEN;
+
+    if (matchIndex >= 0) {
+      if (rssi > unique[matchIndex].rssi) {
+        unique[matchIndex].rssi = rssi;
+        unique[matchIndex].secure = secure;
+      }
+      continue;
+    }
+
+    if (uniqueCount < 32) {
+      unique[uniqueCount].ssid = ssid;
+      unique[uniqueCount].rssi = rssi;
+      unique[uniqueCount].secure = secure;
+      uniqueCount++;
+    }
+  }
+
+  String json = "[";
+  for (uint8_t i = 0; i < uniqueCount; ++i) {
+    if (i > 0) json += ",";
+    json += "{\"ssid\":\"" + unique[i].ssid + "\",\"rssi\":" + String(unique[i].rssi) + ",\"secure\":" + (unique[i].secure ? "true" : "false") + "}";
+  }
+  json += "]";
+  return json;
+}
+
+bool trySavedNetworks() {
+  if (savedNetworkCount == 0) {
+    return false;
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(false);
+  WiFi.scanNetworks(true, true);
+  wifiScanPending = true;
+  wifiScanJsonCache = "[]";
+  wifiState = WIFI_STATE_SCANNING;
+  wifiStateChangedMs = millis();
+  return true;
+}
+
+void startSetupAP() {
+  apMode = true;
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(SETUP_AP_SSID, SETUP_AP_PASSWORD, WIFI_SETUP_AP_CHANNEL);
+  currentIp = WiFi.softAPIP().toString();
+  Serial.println();
+  Serial.println("Setup AP started");
+  Serial.print("SSID: ");
+  Serial.println(SETUP_AP_SSID);
+  Serial.print("AP IP: ");
+  Serial.println(currentIp);
+}
+
+void stopSetupAP() {
+  apMode = false;
+  WiFi.softAPdisconnect(true);
+  WiFi.hostname(HOSTNAME);
+}
+
+void startMDNS() {
+  if (!WiFi.isConnected()) return;
+  if (!MDNS.begin(HOSTNAME)) {
+    Serial.println("mDNS start failed");
+    return;
+  }
+  MDNS.addService("http", "tcp", 80);
+  Serial.print("mDNS ready: http://");
+  Serial.print(HOSTNAME);
+  Serial.println(".local");
+}
+
 void handleStatus() {
   String json;
   json.reserve(256);
+
+  wifiConnected = WiFi.status() == WL_CONNECTED;
+  if (wifiConnected) {
+    currentWifiSsid = WiFi.SSID();
+    currentWifiRssi = WiFi.RSSI();
+    currentIp = WiFi.localIP().toString();
+  } else if (apMode) {
+    currentIp = WiFi.softAPIP().toString();
+    currentWifiSsid = SETUP_AP_SSID;
+    currentWifiRssi = 0;
+  } else {
+    currentIp = "";
+    currentWifiSsid = "";
+    currentWifiRssi = 0;
+  }
 
   json = "{";
   json += "\"r\":" + String(red) + ",";
@@ -368,19 +706,141 @@ void handleStatus() {
   json += "\"b\":" + String(blue) + ",";
   json += "\"w\":" + String(white) + ",";
   json += "\"d\":" + String(masterDimmer) + ",";
+  json += "\"fan\":" + String(fanSpeed) + ",";
   json += "\"mode\":" + String(mode) + ",";
   json += "\"weather\":" + String(weather) + ",";
+  json += "\"dosing\":" + String(dosingActive ? "true" : "false") + ",";
+  json += "\"dosingDurationMs\":" + String(dosingDurationMs) + ",";
+  json += "\"dosingRemainingMs\":" + String(getDosingRemainingMs()) + ",";
   json += "\"time\":\"" + timeStr + "\",";
   json += "\"phase\":\"" + phase + "\",";
-
-  if (WiFi.status() == WL_CONNECTED) {
-    json += "\"wifi\":\"" + WiFi.localIP().toString() + "\"";
-  } else {
-    json += "\"wifi\":\"未接続\"";
-  }
-
+  json += "\"wifiConnected\":" + String(wifiConnected ? "true" : "false") + ",";
+  json += "\"ssid\":\"" + currentWifiSsid + "\",";
+  json += "\"wifi\":\"" + (wifiConnected ? WiFi.localIP().toString() : (apMode ? WiFi.softAPIP().toString() : "未接続")) + "\",";
+  json += "\"rssi\":" + String(currentWifiRssi) + ",";
+  json += "\"ip\":\"" + currentIp + "\",";
+  json += "\"apMode\":" + String(apMode ? "true" : "false") + ",";
+  json += "\"hostname\":\"" + String(HOSTNAME) + ".local\"";
   json += "}";
   server.send(200, "application/json; charset=utf-8", json);
+}
+
+void handleWifiScan() {
+  const int scanComplete = WiFi.scanComplete();
+  if (scanComplete < 0) {
+    WiFi.scanNetworks(true, true);
+    wifiScanPending = true;
+    wifiScanJsonCache = "[]";
+    wifiState = WIFI_STATE_SCANNING;
+    wifiStateChangedMs = millis();
+    server.send(200, "application/json; charset=utf-8", "{\"ok\":true,\"status\":\"scan_started\"}");
+    return;
+  }
+
+  wifiScanJsonCache = buildScanJson();
+  wifiScanPending = false;
+  server.send(200, "application/json; charset=utf-8", wifiScanJsonCache);
+}
+
+void handleWifiResults() {
+  const int scanComplete = WiFi.scanComplete();
+  if (scanComplete < 0) {
+    server.send(200, "application/json; charset=utf-8", "{\"ok\":true,\"status\":\"scan_pending\"}");
+    return;
+  }
+
+  wifiScanJsonCache = buildScanJson();
+  wifiScanPending = false;
+  server.send(200, "application/json; charset=utf-8", wifiScanJsonCache);
+}
+
+void handleWifiSave() {
+  String ssid = server.arg("ssid");
+  String password = server.arg("password");
+  if (ssid.length() == 0) {
+    server.send(400, "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"empty_ssid\"}");
+    return;
+  }
+
+  saveNetwork(ssid, password);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid.c_str(), password.c_str());
+  lastWifiRetryMs = millis();
+
+  String json = "{\"ok\":true,\"ssid\":\"" + ssid + "\"}";
+  server.send(200, "application/json; charset=utf-8", json);
+}
+
+void handleWifiSaved() {
+  String json = "[";
+  for (uint8_t i = 0; i < savedNetworkCount; ++i) {
+    if (i > 0) json += ",";
+    json += "{\"id\":" + String(i) + ",\"ssid\":\"" + savedNetworks[i].ssid + "\"}";
+  }
+  json += "]";
+  server.send(200, "application/json; charset=utf-8", json);
+}
+
+void handleWifiDelete() {
+  uint8_t index = server.hasArg("id") ? static_cast<uint8_t>(server.arg("id").toInt()) : 0;
+  if (index >= savedNetworkCount) {
+    server.send(400, "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"invalid_id\"}");
+    return;
+  }
+
+  const String targetSsid = savedNetworks[index].ssid;
+  deleteNetworkByIndex(index);
+  if (WiFi.SSID() == targetSsid) {
+    WiFi.disconnect(false);
+  }
+
+  server.send(200, "application/json; charset=utf-8", "{\"ok\":true}");
+}
+
+void handleFan() {
+  if (server.hasArg("speed")) {
+    const int requested = server.arg("speed").toInt();
+    setFanSpeed(constrain(requested, 0, 100));
+  }
+
+  server.send(200, "text/plain; charset=utf-8", "OK");
+}
+
+void handleDosingStart() {
+  uint32_t requestedMs = DOSING_DEFAULT_MS;
+  if (server.hasArg("ms")) {
+    requestedMs = static_cast<uint32_t>(server.arg("ms").toInt());
+  }
+
+  if (!startDosing(requestedMs)) {
+    server.send(400, "text/plain; charset=utf-8", "Invalid dosing time");
+    return;
+  }
+
+  dosingDurationMs = requestedMs;
+  markSettingsDirty();
+  server.send(200, "text/plain; charset=utf-8", "OK");
+}
+
+void handleDosingStop() {
+  stopDosing();
+  server.send(200, "text/plain; charset=utf-8", "OK");
+}
+
+void handleDosingConfig() {
+  uint32_t requestedMs = DOSING_DEFAULT_MS;
+  if (server.hasArg("ms")) {
+    requestedMs = static_cast<uint32_t>(server.arg("ms").toInt());
+  }
+
+  if (requestedMs < DOSING_STEP_MS || requestedMs > DOSING_MAX_RUN_MS || (requestedMs % DOSING_STEP_MS) != 0) {
+    server.send(400, "text/plain; charset=utf-8", "Invalid dosing duration");
+    return;
+  }
+
+  dosingDurationMs = requestedMs;
+  markSettingsDirty();
+  server.send(200, "text/plain; charset=utf-8", "OK");
 }
 
 void handleMode() {
@@ -1027,104 +1487,148 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     </div>
 
     <div class="panel">
-      <div class="panel-title"><span class="icon">✦</span><span>Mode</span></div>
-      <div class="mode-grid">
-        <button class="segmented" data-mode="0" id="mode-auto">AUTO</button>
-        <button class="segmented active" data-mode="1" id="mode-manual">MANUAL</button>
+      <div class="panel-title"><span class="icon">☀</span><span>LIGHT</span></div>
+
+      <div class="panel" style="margin:0 0 12px; padding:12px;">
+        <div class="panel-title" style="margin-bottom: 10px;"><span class="icon">✦</span><span>Mode</span></div>
+        <div class="mode-grid">
+          <button class="segmented" data-mode="0" id="mode-auto">AUTO</button>
+          <button class="segmented active" data-mode="1" id="mode-manual">MANUAL</button>
+        </div>
+      </div>
+
+      <div class="panel" style="margin:0 0 12px; padding:12px;">
+        <div class="panel-title" style="margin-bottom: 10px;"><span class="icon">☼</span><span>Weather</span></div>
+        <div class="weather-grid">
+          <button class="segmented weather active" data-weather="0" id="weather-sunny">Sunny</button>
+          <button class="segmented weather" data-weather="1" id="weather-cloudy">Cloudy</button>
+          <button class="segmented weather" data-weather="2" id="weather-rain">Rain</button>
+        </div>
+      </div>
+
+      <div class="panel" style="margin:0; padding:12px;">
+        <div class="panel-title" style="margin-bottom: 10px;"><span class="icon">▤</span><span>Levels</span></div>
+
+        <div class="levels-wrap">
+          <div class="level-row" data-channel="r">
+            <div class="label"><span class="swatch" style="background:#ef5a4d"></span>Red</div>
+            <div class="slider-area" data-color="#ef5a4d">
+              <div class="slider-rail"><div class="slider-fill" style="--rail-color:#ef5a4d"></div><div class="slider-ticks"><span></span><span></span><span></span><span></span><span></span></div></div>
+              <input id="r" type="range" min="0" max="255" step="1" value="255" aria-label="Red">
+              <div class="range-value" id="r-bubble">255</div>
+            </div>
+            <div class="slider-output">
+              <div class="value-primer" id="r-value">255</div>
+              <div class="stepper">
+                <button class="step-btn" data-channel="r" data-step="-1">−</button>
+                <button class="step-btn" data-channel="r" data-step="1">＋</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="level-row" data-channel="g">
+            <div class="label"><span class="swatch" style="background:#49d46d"></span>Green</div>
+            <div class="slider-area" data-color="#49d46d">
+              <div class="slider-rail"><div class="slider-fill" style="--rail-color:#49d46d"></div><div class="slider-ticks"><span></span><span></span><span></span><span></span><span></span></div></div>
+              <input id="g" type="range" min="0" max="255" step="1" value="0" aria-label="Green">
+              <div class="range-value" id="g-bubble">0</div>
+            </div>
+            <div class="slider-output">
+              <div class="value-primer" id="g-value">0</div>
+              <div class="stepper">
+                <button class="step-btn" data-channel="g" data-step="-1">−</button>
+                <button class="step-btn" data-channel="g" data-step="1">＋</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="level-row" data-channel="b">
+            <div class="label"><span class="swatch" style="background:#4ea3ff"></span>Blue</div>
+            <div class="slider-area" data-color="#4ea3ff">
+              <div class="slider-rail"><div class="slider-fill" style="--rail-color:#4ea3ff"></div><div class="slider-ticks"><span></span><span></span><span></span><span></span><span></span></div></div>
+              <input id="b" type="range" min="0" max="255" step="1" value="0" aria-label="Blue">
+              <div class="range-value" id="b-bubble">0</div>
+            </div>
+            <div class="slider-output">
+              <div class="value-primer" id="b-value">0</div>
+              <div class="stepper">
+                <button class="step-btn" data-channel="b" data-step="-1">−</button>
+                <button class="step-btn" data-channel="b" data-step="1">＋</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="level-row" data-channel="w">
+            <div class="label"><span class="swatch" style="background:#e4ecff"></span>White</div>
+            <div class="slider-area" data-color="#e4ecff">
+              <div class="slider-rail"><div class="slider-fill" style="--rail-color:#e4ecff"></div><div class="slider-ticks"><span></span><span></span><span></span><span></span><span></span></div></div>
+              <input id="w" type="range" min="0" max="255" step="1" value="0" aria-label="White">
+              <div class="range-value" id="w-bubble">0</div>
+            </div>
+            <div class="slider-output">
+              <div class="value-primer" id="w-value">0</div>
+              <div class="stepper">
+                <button class="step-btn" data-channel="w" data-step="-1">−</button>
+                <button class="step-btn" data-channel="w" data-step="1">＋</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="level-row" data-channel="d">
+            <div class="label"><span class="swatch" style="background:#d268ff"></span>Master</div>
+            <div class="slider-area" data-color="#d268ff">
+              <div class="slider-rail"><div class="slider-fill" style="--rail-color:#d268ff"></div><div class="slider-ticks"><span></span><span></span><span></span><span></span><span></span></div></div>
+              <input id="d" type="range" min="0" max="255" step="1" value="255" aria-label="Master Dimmer">
+              <div class="range-value" id="d-bubble">255</div>
+            </div>
+            <div class="slider-output">
+              <div class="value-primer" id="d-value">255</div>
+              <div class="stepper">
+                <button class="step-btn" data-channel="d" data-step="-1">−</button>
+                <button class="step-btn" data-channel="d" data-step="1">＋</button>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
 
     <div class="panel">
-      <div class="panel-title"><span class="icon">☼</span><span>Weather</span></div>
-      <div class="weather-grid">
-        <button class="segmented weather active" data-weather="0" id="weather-sunny">Sunny</button>
-        <button class="segmented weather" data-weather="1" id="weather-cloudy">Cloudy</button>
-        <button class="segmented weather" data-weather="2" id="weather-rain">Rain</button>
-      </div>
-    </div>
-
-    <div class="panel">
-      <div class="panel-title"><span class="icon">▤</span><span>Levels</span></div>
-
+      <div class="panel-title"><span class="icon">❋</span><span>FAN</span></div>
       <div class="levels-wrap">
-        <div class="level-row" data-channel="r">
-          <div class="label"><span class="swatch" style="background:#ef5a4d"></span>Red</div>
-          <div class="slider-area" data-color="#ef5a4d">
-            <div class="slider-rail"><div class="slider-fill" style="--rail-color:#ef5a4d"></div><div class="slider-ticks"><span></span><span></span><span></span><span></span><span></span></div></div>
-            <input id="r" type="range" min="0" max="255" step="1" value="255" aria-label="Red">
-            <div class="range-value" id="r-bubble">255</div>
-          </div>
-          <div class="slider-output">
-            <div class="value-primer" id="r-value">255</div>
-            <div class="stepper">
-              <button class="step-btn" data-channel="r" data-step="-1">−</button>
-              <button class="step-btn" data-channel="r" data-step="1">＋</button>
-            </div>
-          </div>
+        <div class="level-row" style="grid-template-columns: 1fr auto;">
+          <div class="label">Speed</div>
+          <div class="value-primer" id="fan-value">0%</div>
         </div>
-
-        <div class="level-row" data-channel="g">
-          <div class="label"><span class="swatch" style="background:#49d46d"></span>Green</div>
-          <div class="slider-area" data-color="#49d46d">
-            <div class="slider-rail"><div class="slider-fill" style="--rail-color:#49d46d"></div><div class="slider-ticks"><span></span><span></span><span></span><span></span><span></span></div></div>
-            <input id="g" type="range" min="0" max="255" step="1" value="0" aria-label="Green">
-            <div class="range-value" id="g-bubble">0</div>
-          </div>
-          <div class="slider-output">
-            <div class="value-primer" id="g-value">0</div>
-            <div class="stepper">
-              <button class="step-btn" data-channel="g" data-step="-1">−</button>
-              <button class="step-btn" data-channel="g" data-step="1">＋</button>
-            </div>
-          </div>
+        <div class="slider-area" style="padding-top: 0;">
+          <div class="slider-rail" style="--rail-color:#6dc5ff;"><div class="slider-fill" id="fan-fill" style="--rail-color:#6dc5ff; width:0%; background:#6dc5ff;"></div><div class="slider-ticks"><span></span><span></span><span></span><span></span><span></span></div></div>
+          <input id="fan-slider" type="range" min="0" max="100" step="1" value="0" aria-label="Fan speed">
+          <div class="range-value" id="fan-bubble" style="color:#6dc5ff; left:0%;">0</div>
         </div>
-
-        <div class="level-row" data-channel="b">
-          <div class="label"><span class="swatch" style="background:#4ea3ff"></span>Blue</div>
-          <div class="slider-area" data-color="#4ea3ff">
-            <div class="slider-rail"><div class="slider-fill" style="--rail-color:#4ea3ff"></div><div class="slider-ticks"><span></span><span></span><span></span><span></span><span></span></div></div>
-            <input id="b" type="range" min="0" max="255" step="1" value="0" aria-label="Blue">
-            <div class="range-value" id="b-bubble">0</div>
-          </div>
-          <div class="slider-output">
-            <div class="value-primer" id="b-value">0</div>
-            <div class="stepper">
-              <button class="step-btn" data-channel="b" data-step="-1">−</button>
-              <button class="step-btn" data-channel="b" data-step="1">＋</button>
-            </div>
-          </div>
+        <div class="quick-presets" style="margin-top: 6px;">
+          <button class="preset-btn" data-fan="0"><span class="preset-icon">◌</span><span>OFF</span></button>
+          <button class="preset-btn" data-fan="25"><span class="preset-icon">◐</span><span>25%</span></button>
+          <button class="preset-btn" data-fan="50"><span class="preset-icon">◔</span><span>50%</span></button>
+          <button class="preset-btn" data-fan="75"><span class="preset-icon">◑</span><span>75%</span></button>
+          <button class="preset-btn" data-fan="100"><span class="preset-icon">◉</span><span>100%</span></button>
         </div>
+      </div>
+    </div>
 
-        <div class="level-row" data-channel="w">
-          <div class="label"><span class="swatch" style="background:#e4ecff"></span>White</div>
-          <div class="slider-area" data-color="#e4ecff">
-            <div class="slider-rail"><div class="slider-fill" style="--rail-color:#e4ecff"></div><div class="slider-ticks"><span></span><span></span><span></span><span></span><span></span></div></div>
-            <input id="w" type="range" min="0" max="255" step="1" value="0" aria-label="White">
-            <div class="range-value" id="w-bubble">0</div>
-          </div>
-          <div class="slider-output">
-            <div class="value-primer" id="w-value">0</div>
-            <div class="stepper">
-              <button class="step-btn" data-channel="w" data-step="-1">−</button>
-              <button class="step-btn" data-channel="w" data-step="1">＋</button>
-            </div>
-          </div>
+    <div class="panel">
+      <div class="panel-title"><span class="icon">💧</span><span>DOSING</span></div>
+      <div class="levels-wrap">
+        <div class="level-row" style="grid-template-columns: 1fr auto;">
+          <div class="label">Remaining</div>
+          <div class="value-primer" id="dosing-remaining">00:00</div>
         </div>
-
-        <div class="level-row" data-channel="d">
-          <div class="label"><span class="swatch" style="background:#d268ff"></span>Master</div>
-          <div class="slider-area" data-color="#d268ff">
-            <div class="slider-rail"><div class="slider-fill" style="--rail-color:#d268ff"></div><div class="slider-ticks"><span></span><span></span><span></span><span></span><span></span></div></div>
-            <input id="d" type="range" min="0" max="255" step="1" value="255" aria-label="Master Dimmer">
-            <div class="range-value" id="d-bubble">255</div>
-          </div>
-          <div class="slider-output">
-            <div class="value-primer" id="d-value">255</div>
-            <div class="stepper">
-              <button class="step-btn" data-channel="d" data-step="-1">−</button>
-              <button class="step-btn" data-channel="d" data-step="1">＋</button>
-            </div>
-          </div>
+        <div class="level-row" style="grid-template-columns: 1fr 1fr; gap: 10px;">
+          <button class="segmented" id="dosing-start-btn" type="button">START</button>
+          <button class="segmented" id="dosing-stop-btn" type="button">STOP</button>
+        </div>
+        <div class="level-row" style="grid-template-columns: 1fr auto; align-items: center;">
+          <div class="label">Duration</div>
+          <div class="slider-output"><input id="dosing-ms" type="number" min="500" max="10000" step="500" value="3000" style="width: 90px; border-radius: 10px; border: 1px solid var(--border); background: rgba(15,23,32,0.9); color: var(--text); padding: 8px 10px; font-weight:700; text-align:center;"></div>
         </div>
       </div>
     </div>
@@ -1168,6 +1672,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       return Math.min(255, Math.max(0, value));
     }
 
+    function clampFan(value) {
+      return Math.min(100, Math.max(0, value));
+    }
+
     function setSliderVisual(id, value) {
       const input = document.getElementById(id);
       const bubble = document.getElementById(id + '-bubble');
@@ -1202,6 +1710,14 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       });
     }
 
+    function formatRemaining(ms) {
+      const safe = Math.max(0, Number(ms) || 0);
+      const totalSeconds = Math.ceil(safe / 1000);
+      const minutes = Math.floor(totalSeconds / 60);
+      const seconds = totalSeconds % 60;
+      return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+    }
+
     function updateStatus() {
       fetch('/status')
         .then((response) => response.json())
@@ -1216,6 +1732,34 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
           document.getElementById('mode-auto').classList.toggle('active', modeValue === 0);
           document.getElementById('mode-manual').classList.toggle('active', modeValue === 1);
           applyWeatherState();
+
+          const fanValue = Number(data.fan ?? 0);
+          const fanSlider = document.getElementById('fan-slider');
+          const fanBubble = document.getElementById('fan-bubble');
+          const fanFill = document.getElementById('fan-fill');
+          if (fanSlider) {
+            fanSlider.value = fanValue;
+          }
+          if (fanBubble) {
+            fanBubble.textContent = fanValue;
+            fanBubble.style.left = `${fanValue}%`;
+          }
+          if (fanFill) {
+            fanFill.style.width = `${fanValue}%`;
+          }
+          const fanLabel = document.getElementById('fan-value');
+          if (fanLabel) fanLabel.textContent = `${fanValue}%`;
+
+          const remaining = document.getElementById('dosing-remaining');
+          if (remaining) {
+            remaining.textContent = formatRemaining(Number(data.dosingRemainingMs ?? 0));
+          }
+
+          const dosingInput = document.getElementById('dosing-ms');
+          const dosingDurationMs = Number(data.dosingDurationMs ?? 3000);
+          if (dosingInput && document.activeElement !== dosingInput) {
+            dosingInput.value = dosingDurationMs;
+          }
 
           if (!isUserDragging) {
             const values = { r: data.r, g: data.g, b: data.b, w: data.w, d: data.d };
@@ -1239,6 +1783,39 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
     function setWeather(value) {
       fetch('/weather?w=' + value).then(updateStatus);
+    }
+
+    let fanDebounceTimer = null;
+
+    function setFan(value) {
+      const safe = clampFan(Number(value) || 0);
+      if (!Number.isFinite(safe)) return;
+      const fanSlider = document.getElementById('fan-slider');
+      if (fanSlider) fanSlider.value = safe;
+      const fanBubble = document.getElementById('fan-bubble');
+      const fanFill = document.getElementById('fan-fill');
+      const fanLabel = document.getElementById('fan-value');
+      if (fanBubble) {
+        fanBubble.textContent = safe;
+        fanBubble.style.left = `${safe}%`;
+      }
+      if (fanFill) fanFill.style.width = `${safe}%`;
+      if (fanLabel) fanLabel.textContent = `${safe}%`;
+
+      clearTimeout(fanDebounceTimer);
+      fanDebounceTimer = setTimeout(() => {
+        fetch('/fan?speed=' + safe).then(updateStatus);
+      }, 80);
+    }
+
+    function sendDosingStart() {
+      const ms = Math.max(500, Math.min(10000, Number(document.getElementById('dosing-ms').value) || 3000));
+      document.getElementById('dosing-ms').value = ms;
+      fetch('/dosing/start?ms=' + ms).then(updateStatus);
+    }
+
+    function sendDosingStop() {
+      fetch('/dosing/stop').then(updateStatus);
     }
 
     function sendLevels() {
@@ -1292,7 +1869,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       holdChannel = null;
     }
 
-    document.querySelectorAll('input[type="range"]').forEach((slider) => {
+    document.querySelectorAll('#r, #g, #b, #w, #d').forEach((slider) => {
       slider.addEventListener('input', () => {
         const id = slider.id;
         const value = clampChannel(Number(slider.value));
@@ -1322,6 +1899,11 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       }, { passive: true });
     });
 
+    document.getElementById('fan-slider')?.addEventListener('input', (event) => {
+      const value = clampFan(Number(event.target.value) || 0);
+      setFan(value);
+    });
+
     document.querySelectorAll('.step-btn').forEach((button) => {
       const channel = button.dataset.channel;
       const delta = Number(button.dataset.step || 1);
@@ -1343,6 +1925,34 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       }
     });
 
+    document.getElementById('fan-slider')?.addEventListener('input', (event) => {
+      const value = Math.max(0, Math.min(100, Number(event.target.value) || 0));
+      const bubble = document.getElementById('fan-bubble');
+      const fill = document.getElementById('fan-fill');
+      if (bubble) {
+        bubble.textContent = value;
+        bubble.style.left = `${value}%`;
+      }
+      if (fill) fill.style.width = `${value}%`;
+      const label = document.getElementById('fan-value');
+      if (label) label.textContent = `${value}%`;
+      setFan(value);
+    });
+
+    document.querySelectorAll('[data-fan]').forEach((button) => {
+      button.addEventListener('click', () => setFan(Number(button.dataset.fan || 0)));
+    });
+
+    const dosingInput = document.getElementById('dosing-ms');
+    dosingInput?.addEventListener('change', () => {
+      const ms = Math.max(500, Math.min(10000, Number(dosingInput.value) || 3000));
+      dosingInput.value = ms;
+      fetch('/dosing/config?ms=' + ms).then(updateStatus);
+    });
+
+    document.getElementById('dosing-start-btn')?.addEventListener('click', sendDosingStart);
+    document.getElementById('dosing-stop-btn')?.addEventListener('click', sendDosingStop);
+
     document.querySelectorAll('.preset-btn').forEach((button) => {
       button.addEventListener('click', () => {
         const preset = button.dataset.preset;
@@ -1360,7 +1970,6 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
           setSliderVisual(key, Number(value));
         });
 
-        // 既存の /levels API のみを使い、バックエンド新設は行わない。
         sendLevels();
       });
     });
@@ -1386,6 +1995,15 @@ void setupWebServer() {
   server.on("/mode", handleMode);
   server.on("/weather", handleWeather);
   server.on("/levels", handleLevels);
+  server.on("/fan", handleFan);
+  server.on("/dosing/start", handleDosingStart);
+  server.on("/dosing/stop", handleDosingStop);
+  server.on("/dosing/config", handleDosingConfig);
+  server.on("/wifi/scan", handleWifiScan);
+  server.on("/wifi/results", handleWifiResults);
+  server.on("/wifi/save", handleWifiSave);
+  server.on("/wifi/saved", handleWifiSaved);
+  server.on("/wifi/delete", handleWifiDelete);
 
   server.onNotFound([]() {
     server.send(404, "text/plain; charset=utf-8", "Not Found");
@@ -1399,32 +2017,166 @@ void setupWebServer() {
 // -----------------------------------------------------------------------------
 
 void startWiFi() {
+  loadSavedNetworks();
   WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  previousWifiStatus = WiFi.status();
-  lastWifiRetryMs = millis();
+  WiFi.hostname(HOSTNAME);
+  WiFi.disconnect(false);
+  wifiScanPending = false;
+  wifiState = WIFI_STATE_IDLE;
+  wifiStateChangedMs = millis();
+
+  if (savedNetworkCount > 0) {
+    trySavedNetworks();
+    return;
+  }
+
+  if (strlen(WIFI_SSID) > 0 && strcmp(WIFI_SSID, "YOUR_WIFI_SSID") != 0) {
+    wifiConnectSsid = WIFI_SSID;
+    wifiConnectPass = WIFI_PASSWORD;
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+    wifiState = WIFI_STATE_CONNECTING;
+    wifiStateChangedMs = millis();
+    return;
+  }
+
+  startSetupAP();
+  wifiState = WIFI_STATE_FAILED;
+  wifiStateChangedMs = millis();
 }
 
 void maintainWiFi() {
   const wl_status_t currentStatus = WiFi.status();
 
-  if (currentStatus != previousWifiStatus) {
-    previousWifiStatus = currentStatus;
-
-    if (currentStatus == WL_CONNECTED) {
+  if (currentStatus == WL_CONNECTED) {
+    if (wifiState != WIFI_STATE_CONNECTED) {
+      wifiState = WIFI_STATE_CONNECTED;
+      wifiStateChangedMs = millis();
+      if (apMode) {
+        stopSetupAP();
+      }
+      startMDNS();
       Serial.println();
       Serial.print("Wi-Fi connected. IP: ");
       Serial.println(WiFi.localIP());
-    } else {
-      Serial.println("Wi-Fi disconnected. DMX transmission continues.");
     }
+    previousWifiStatus = currentStatus;
+    return;
   }
 
-  // Wi-Fiに接続できなくてもDMX送信は止めない。
-  if (currentStatus != WL_CONNECTED && millis() - lastWifiRetryMs >= 30000) {
-    Serial.println("Retrying Wi-Fi connection...");
-    WiFi.reconnect();
-    lastWifiRetryMs = millis();
+  if (currentStatus != previousWifiStatus) {
+    previousWifiStatus = currentStatus;
+    Serial.println("Wi-Fi disconnected. DMX transmission continues.");
+  }
+
+  switch (wifiState) {
+    case WIFI_STATE_IDLE:
+      if (savedNetworkCount > 0) {
+        trySavedNetworks();
+      } else if (strlen(WIFI_SSID) > 0 && strcmp(WIFI_SSID, "YOUR_WIFI_SSID") != 0) {
+        wifiConnectSsid = WIFI_SSID;
+        wifiConnectPass = WIFI_PASSWORD;
+        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+        wifiState = WIFI_STATE_CONNECTING;
+        wifiStateChangedMs = millis();
+      } else if (!apMode) {
+        startSetupAP();
+        wifiState = WIFI_STATE_FAILED;
+        wifiStateChangedMs = millis();
+      }
+      return;
+
+    case WIFI_STATE_SCAN_START:
+      WiFi.scanNetworks(true, true);
+      wifiScanPending = true;
+      wifiScanJsonCache = "[]";
+      wifiState = WIFI_STATE_SCANNING;
+      wifiStateChangedMs = millis();
+      return;
+
+    case WIFI_STATE_SCANNING: {
+      const int found = WiFi.scanComplete();
+      if (found < 0) {
+        return;
+      }
+
+      wifiScanJsonCache = buildScanJson();
+      wifiScanPending = false;
+
+      int bestIndex = -1;
+      int bestRssi = -9999;
+      for (int i = 0; i < found; ++i) {
+        for (uint8_t j = 0; j < savedNetworkCount; ++j) {
+          if (WiFi.SSID(i) == savedNetworks[j].ssid) {
+            if (WiFi.RSSI(i) > bestRssi) {
+              bestRssi = WiFi.RSSI(i);
+              bestIndex = j;
+            }
+          }
+        }
+      }
+
+      if (bestIndex >= 0) {
+        wifiConnectSsid = savedNetworks[bestIndex].ssid;
+        wifiConnectPass = savedNetworks[bestIndex].password;
+        Serial.print("Trying saved Wi-Fi: ");
+        Serial.println(wifiConnectSsid);
+        WiFi.begin(wifiConnectSsid.c_str(), wifiConnectPass.c_str());
+        wifiState = WIFI_STATE_CONNECTING;
+        wifiStateChangedMs = millis();
+      } else {
+        WiFi.scanDelete();
+        if (strlen(WIFI_SSID) > 0 && strcmp(WIFI_SSID, "YOUR_WIFI_SSID") != 0) {
+          wifiConnectSsid = WIFI_SSID;
+          wifiConnectPass = WIFI_PASSWORD;
+          WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+          wifiState = WIFI_STATE_CONNECTING;
+          wifiStateChangedMs = millis();
+        } else {
+          if (!apMode) {
+            startSetupAP();
+          }
+          wifiState = WIFI_STATE_FAILED;
+          wifiStateChangedMs = millis();
+        }
+      }
+      return;
+    }
+
+    case WIFI_STATE_CONNECTING:
+      if (millis() - wifiStateChangedMs >= WIFI_RECONNECT_RETRY_MS) {
+        WiFi.disconnect(false);
+        if (savedNetworkCount > 0) {
+          trySavedNetworks();
+        } else if (strlen(WIFI_SSID) > 0 && strcmp(WIFI_SSID, "YOUR_WIFI_SSID") != 0) {
+          WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+          wifiState = WIFI_STATE_CONNECTING;
+          wifiStateChangedMs = millis();
+        } else if (!apMode) {
+          startSetupAP();
+          wifiState = WIFI_STATE_FAILED;
+          wifiStateChangedMs = millis();
+        }
+      }
+      return;
+
+    case WIFI_STATE_FAILED:
+      if (millis() - wifiStateChangedMs >= WIFI_RECONNECT_RETRY_MS) {
+        if (savedNetworkCount > 0) {
+          trySavedNetworks();
+        } else if (strlen(WIFI_SSID) > 0 && strcmp(WIFI_SSID, "YOUR_WIFI_SSID") != 0) {
+          WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+          wifiState = WIFI_STATE_CONNECTING;
+          wifiStateChangedMs = millis();
+        } else if (!apMode) {
+          startSetupAP();
+          wifiStateChangedMs = millis();
+        }
+      }
+      return;
+
+    case WIFI_STATE_CONNECTED:
+    default:
+      return;
   }
 }
 
@@ -1443,12 +2195,16 @@ void setup() {
 
   // DMXを最初に起動する。Wi-Fi接続待ちでDMXを止めない。
   setupDMX();
+  setupFan();
+  setupDosing();
 
+  loadSavedNetworks();
   startWiFi();
   configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
   setupWebServer();
 
   Serial.println("DMX started: TX=GPIO18, DE/RE=GPIO4");
+  Serial.println("Fan PWM: GPIO25 @ 50Hz / Dosing: GPIO26 OFF");
   Serial.println("Initial output: Red=255, Master=255, MANUAL mode");
 }
 
@@ -1463,6 +2219,7 @@ void loop() {
 
   server.handleClient();
   maintainWiFi();
+  updateDosing();
   saveSettings();
 
   if (now - lastTimeMs >= 1000) {
