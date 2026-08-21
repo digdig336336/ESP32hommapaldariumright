@@ -1,7 +1,9 @@
 #include <Arduino.h>
+#include <esp_system.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <DNSServer.h>
 #include <ESPmDNS.h>
 #include <time.h>
 #include <math.h>
@@ -106,13 +108,24 @@ uint32_t dosingDurationMs = DOSING_DEFAULT_MS;
 
 String phase = "手動";
 String timeStr = "--:--";
+String dateStr = "----/--/-- (-)";
 
 constexpr uint8_t MAX_SAVED_NETWORKS = 5;
 constexpr uint32_t WIFI_RECONNECT_RETRY_MS = 45000;
+constexpr uint32_t WIFI_SAVED_NETWORK_TIMEOUT_MS = 10000;
+constexpr uint32_t WIFI_SCAN_TIMEOUT_MS = 15000;
 constexpr uint8_t WIFI_SETUP_AP_CHANNEL = 1;
-const char* SETUP_AP_SSID = "Paludarium-Setup";
 const char* SETUP_AP_PASSWORD = "paludarium";
-const char* HOSTNAME = "paludarium";
+
+// 同じプログラムを複数台へ書き込んでも名前が衝突しないよう、
+// setup()でESP32固有MACの末尾6桁から自動生成する。
+// 例:
+//   deviceId    = honma-paludarium-a1b2c3（将来のAWS IoT Thing名）
+//   hostname    = paludarium-a1b2c3      （mDNS）
+//   setupApSsid = Paludarium-A1B2C3-Setup（初期設定用Wi-Fi）
+String deviceId = "";
+String hostname = "";
+String setupApSsid = "";
 
 struct SavedNetwork {
   String ssid;
@@ -121,6 +134,7 @@ struct SavedNetwork {
 
 SavedNetwork savedNetworks[MAX_SAVED_NETWORKS];
 uint8_t savedNetworkCount = 0;
+uint8_t savedNetworkAttemptIndex = 0;
 bool apMode = false;
 bool wifiConnected = false;
 String currentWifiSsid = "";
@@ -128,6 +142,13 @@ int currentWifiRssi = 0;
 String currentIp = "";
 uint32_t lastWifiRetryMs = 0;
 uint32_t lastSavedScanMs = 0;
+uint32_t lastDmxMs = 0;
+uint32_t lastTimeMs = 0;
+uint32_t lastLightMs = 0;
+uint32_t pendingWifiReconnectMs = 0;
+String pendingWifiReconnectSsid = "";
+String pendingWifiReconnectPassword = "";
+DNSServer dnsServer;
 wl_status_t previousWifiStatus = WL_IDLE_STATUS;
 
 struct ScanResult {
@@ -152,6 +173,31 @@ String wifiConnectPass = "";
 String wifiScanJsonCache = "[]";
 bool wifiScanPending = false;
 uint32_t wifiStateChangedMs = 0;
+
+void initializeDeviceIdentity() {
+  const uint64_t mac = ESP.getEfuseMac();
+  const uint32_t suffixValue = static_cast<uint32_t>(mac & 0xFFFFFFULL);
+
+  char suffixUpper[7];
+  char suffixLower[7];
+  snprintf(suffixUpper, sizeof(suffixUpper), "%06lX", static_cast<unsigned long>(suffixValue));
+  snprintf(suffixLower, sizeof(suffixLower), "%06lx", static_cast<unsigned long>(suffixValue));
+
+  deviceId = "honma-paludarium-" + String(suffixLower);
+  hostname = "paludarium-" + String(suffixLower);
+  setupApSsid = "Paludarium-" + String(suffixUpper) + "-Setup";
+
+  Serial.println("Device identity initialized");
+  Serial.print("Device ID: ");
+  Serial.println(deviceId);
+  Serial.print("Local URL after Wi-Fi connection: http://");
+  Serial.print(hostname);
+  Serial.println(".local/");
+  Serial.print("Setup AP SSID: ");
+  Serial.println(setupApSsid);
+}
+
+String jsonEscape(const String& input);
 
 // -----------------------------------------------------------------------------
 // DMX処理
@@ -297,6 +343,7 @@ void updateTimeDisplay() {
 
   if (!readLocalTime(timeinfo)) {
     timeStr = "--:--";
+    dateStr = "----/--/-- (-)";
     if (mode == 0) phase = "時刻未同期";
     return;
   }
@@ -304,6 +351,19 @@ void updateTimeDisplay() {
   char buffer[6];
   snprintf(buffer, sizeof(buffer), "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
   timeStr = buffer;
+
+  static const char* WEEKDAYS[] = {"日", "月", "火", "水", "木", "金", "土"};
+  char dateBuffer[24];
+  snprintf(
+    dateBuffer,
+    sizeof(dateBuffer),
+    "%04d/%02d/%02d (%s)",
+    timeinfo.tm_year + 1900,
+    timeinfo.tm_mon + 1,
+    timeinfo.tm_mday,
+    WEEKDAYS[timeinfo.tm_wday]
+  );
+  dateStr = dateBuffer;
 
   if (mode == 1) {
     phase = "手動";
@@ -629,7 +689,7 @@ String buildScanJson() {
   String json = "[";
   for (uint8_t i = 0; i < uniqueCount; ++i) {
     if (i > 0) json += ",";
-    json += "{\"ssid\":\"" + unique[i].ssid + "\",\"rssi\":" + String(unique[i].rssi) + ",\"secure\":" + (unique[i].secure ? "true" : "false") + "}";
+    json += "{\"ssid\":\"" + jsonEscape(unique[i].ssid) + "\",\"rssi\":" + String(unique[i].rssi) + ",\"secure\":" + (unique[i].secure ? "true" : "false") + "}";
   }
   json += "]";
   return json;
@@ -640,44 +700,97 @@ bool trySavedNetworks() {
     return false;
   }
 
-  WiFi.mode(WIFI_STA);
+  WiFi.mode(WIFI_AP_STA);
   WiFi.disconnect(false);
-  WiFi.scanNetworks(true, true);
-  wifiScanPending = true;
-  wifiScanJsonCache = "[]";
-  wifiState = WIFI_STATE_SCANNING;
+
+  if (savedNetworkAttemptIndex >= savedNetworkCount) {
+    savedNetworkAttemptIndex = 0;
+  }
+
+  const uint8_t currentIndex = savedNetworkAttemptIndex;
+  wifiConnectSsid = savedNetworks[currentIndex].ssid;
+  wifiConnectPass = savedNetworks[currentIndex].password;
+  WiFi.begin(wifiConnectSsid.c_str(), wifiConnectPass.c_str());
+  wifiState = WIFI_STATE_CONNECTING;
   wifiStateChangedMs = millis();
   return true;
 }
 
-void startSetupAP() {
-  apMode = true;
+void triggerSetupMode() {
+  if (apMode && WiFi.getMode() == WIFI_AP_STA) {
+    return;
+  }
+
+  apMode = false;
+
+  Serial.println("[A1] WiFi.mode AP_STA start");
+  Serial.flush();
   WiFi.mode(WIFI_AP_STA);
-  WiFi.softAP(SETUP_AP_SSID, SETUP_AP_PASSWORD, WIFI_SETUP_AP_CHANNEL);
+  Serial.println("[A1] WiFi.mode AP_STA OK");
+  Serial.flush();
+
+  if (!startSetupAP()) {
+    Serial.println("ERROR: Setup AP start failed.");
+  }
+  wifiState = WIFI_STATE_FAILED;
+  wifiStateChangedMs = millis();
+}
+
+bool startSetupAP() {
+  Serial.println("[A2] softAPConfig start");
+  Serial.flush();
+  WiFi.softAPConfig(IPAddress(192, 168, 4, 1), IPAddress(192, 168, 4, 1), IPAddress(255, 255, 255, 0));
+  Serial.println("[A2] softAPConfig OK");
+  Serial.flush();
+
+  Serial.println("[A3] softAP start");
+  Serial.flush();
+  const bool started = WiFi.softAP(setupApSsid.c_str(), SETUP_AP_PASSWORD, WIFI_SETUP_AP_CHANNEL);
+  Serial.println("[A3] softAP OK");
+  Serial.flush();
+
+  if (!started) {
+    apMode = false;
+    Serial.print("ERROR: WiFi.softAP() failed for ");
+    Serial.println(setupApSsid);
+    return false;
+  }
+
+  apMode = true;
   currentIp = WiFi.softAPIP().toString();
+
+  Serial.println("[A4] dnsServer start");
+  Serial.flush();
+  dnsServer.start(53, "*", WiFi.softAPIP());
+  Serial.println("[A4] dnsServer OK");
+  Serial.flush();
+
   Serial.println();
   Serial.println("Setup AP started");
   Serial.print("SSID: ");
-  Serial.println(SETUP_AP_SSID);
+  Serial.println(setupApSsid);
   Serial.print("AP IP: ");
   Serial.println(currentIp);
+  return true;
 }
 
 void stopSetupAP() {
-  apMode = false;
+  dnsServer.stop();
   WiFi.softAPdisconnect(true);
-  WiFi.hostname(HOSTNAME);
+  WiFi.mode(WIFI_STA);
+  apMode = false;
+  WiFi.hostname(hostname.c_str());
 }
 
 void startMDNS() {
   if (!WiFi.isConnected()) return;
-  if (!MDNS.begin(HOSTNAME)) {
+  if (!MDNS.begin(hostname.c_str())) {
     Serial.println("mDNS start failed");
     return;
   }
   MDNS.addService("http", "tcp", 80);
   Serial.print("mDNS ready: http://");
-  Serial.print(HOSTNAME);
+  Serial.print(hostname);
   Serial.println(".local");
 }
 
@@ -692,7 +805,7 @@ void handleStatus() {
     currentIp = WiFi.localIP().toString();
   } else if (apMode) {
     currentIp = WiFi.softAPIP().toString();
-    currentWifiSsid = SETUP_AP_SSID;
+    currentWifiSsid = setupApSsid;
     currentWifiRssi = 0;
   } else {
     currentIp = "";
@@ -713,6 +826,7 @@ void handleStatus() {
   json += "\"dosingDurationMs\":" + String(dosingDurationMs) + ",";
   json += "\"dosingRemainingMs\":" + String(getDosingRemainingMs()) + ",";
   json += "\"time\":\"" + timeStr + "\",";
+  json += "\"date\":\"" + dateStr + "\",";
   json += "\"phase\":\"" + phase + "\",";
   json += "\"wifiConnected\":" + String(wifiConnected ? "true" : "false") + ",";
   json += "\"ssid\":\"" + currentWifiSsid + "\",";
@@ -720,7 +834,9 @@ void handleStatus() {
   json += "\"rssi\":" + String(currentWifiRssi) + ",";
   json += "\"ip\":\"" + currentIp + "\",";
   json += "\"apMode\":" + String(apMode ? "true" : "false") + ",";
-  json += "\"hostname\":\"" + String(HOSTNAME) + ".local\"";
+  json += "\"deviceId\":\"" + deviceId + "\",";
+  json += "\"setupApSsid\":\"" + setupApSsid + "\",";
+  json += "\"hostname\":\"" + hostname + ".local\"";
   json += "}";
   server.send(200, "application/json; charset=utf-8", json);
 }
@@ -733,49 +849,108 @@ void handleWifiScan() {
     wifiScanJsonCache = "[]";
     wifiState = WIFI_STATE_SCANNING;
     wifiStateChangedMs = millis();
+    Serial.println("[SCAN] start");
+    Serial.flush();
     server.send(200, "application/json; charset=utf-8", "{\"ok\":true,\"status\":\"scan_started\"}");
     return;
   }
 
   wifiScanJsonCache = buildScanJson();
   wifiScanPending = false;
+  wifiState = (WiFi.status() == WL_CONNECTED) ? WIFI_STATE_CONNECTED : WIFI_STATE_FAILED;
+  wifiStateChangedMs = millis();
   server.send(200, "application/json; charset=utf-8", wifiScanJsonCache);
 }
 
 void handleWifiResults() {
   const int scanComplete = WiFi.scanComplete();
   if (scanComplete < 0) {
+    if (wifiState == WIFI_STATE_SCANNING && (millis() - wifiStateChangedMs) >= WIFI_SCAN_TIMEOUT_MS) {
+      WiFi.scanDelete();
+      wifiScanPending = false;
+      wifiState = (WiFi.status() == WL_CONNECTED) ? WIFI_STATE_CONNECTED : WIFI_STATE_FAILED;
+      wifiStateChangedMs = millis();
+      Serial.println("[SCAN] timeout, continuing AP mode");
+      Serial.flush();
+    }
     server.send(200, "application/json; charset=utf-8", "{\"ok\":true,\"status\":\"scan_pending\"}");
     return;
   }
 
   wifiScanJsonCache = buildScanJson();
   wifiScanPending = false;
+  wifiState = (WiFi.status() == WL_CONNECTED) ? WIFI_STATE_CONNECTED : WIFI_STATE_FAILED;
+  wifiStateChangedMs = millis();
   server.send(200, "application/json; charset=utf-8", wifiScanJsonCache);
+}
+
+String jsonEscape(const String& input) {
+  String result;
+  result.reserve(input.length() + 8);
+
+  for (size_t i = 0; i < input.length(); ++i) {
+    const char ch = input.charAt(i);
+    switch (ch) {
+      case '\\': result += "\\\\"; break;
+      case '"': result += "\\\""; break;
+      case '\n': result += "\\n"; break;
+      case '\r': result += "\\r"; break;
+      case '\t': result += "\\t"; break;
+      default: result += ch; break;
+    }
+  }
+
+  return result;
+}
+
+bool hasConfiguredSecretsWifi() {
+  return (strlen(WIFI_SSID) > 0) && (strcmp(WIFI_SSID, "YOUR_WIFI_SSID") != 0);
+}
+
+void attemptWifiConnection(const String& ssid, const String& password) {
+  if (ssid.length() == 0) {
+    return;
+  }
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.hostname(hostname.c_str());
+  WiFi.disconnect(false);
+  WiFi.begin(ssid.c_str(), password.c_str());
+  wifiConnectSsid = ssid;
+  wifiConnectPass = password;
+  wifiState = WIFI_STATE_CONNECTING;
+  wifiStateChangedMs = millis();
+  Serial.print("Connecting to Wi‑Fi: ");
+  Serial.println(ssid);
 }
 
 void handleWifiSave() {
   String ssid = server.arg("ssid");
   String password = server.arg("password");
+  ssid.trim();
+
   if (ssid.length() == 0) {
     server.send(400, "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"empty_ssid\"}");
     return;
   }
 
   saveNetwork(ssid, password);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid.c_str(), password.c_str());
-  lastWifiRetryMs = millis();
+  pendingWifiReconnectSsid = ssid;
+  pendingWifiReconnectPassword = password;
+  pendingWifiReconnectMs = millis() + 2500;
+  wifiState = WIFI_STATE_CONNECTING;
+  wifiStateChangedMs = millis();
 
-  String json = "{\"ok\":true,\"ssid\":\"" + ssid + "\"}";
+  String json = "{\"ok\":true,\"message\":\"保存しました。接続を試しています。\",\"ssid\":\"" + jsonEscape(ssid) + "\"}";
   server.send(200, "application/json; charset=utf-8", json);
+  delay(10);
 }
 
 void handleWifiSaved() {
   String json = "[";
   for (uint8_t i = 0; i < savedNetworkCount; ++i) {
     if (i > 0) json += ",";
-    json += "{\"id\":" + String(i) + ",\"ssid\":\"" + savedNetworks[i].ssid + "\"}";
+    json += "{\"id\":" + String(i) + ",\"ssid\":\"" + jsonEscape(savedNetworks[i].ssid) + "\"}";
   }
   json += "]";
   server.send(200, "application/json; charset=utf-8", json);
@@ -887,6 +1062,256 @@ void handleLevels() {
 // -----------------------------------------------------------------------------
 // Web UI
 // -----------------------------------------------------------------------------
+
+const char WIFI_SETUP_HTML[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Paludarium Wi‑Fi Setup</title>
+  <style>
+    :root {
+      --bg: #06121d;
+      --panel: #0e1e2d;
+      --card: #12273a;
+      --line: rgba(165, 191, 228, 0.24);
+      --text: #edf5ff;
+      --muted: #9bb5d8;
+      --primary: #67b6ff;
+      --accent: #7f8dff;
+      --success: #4de0a7;
+      --danger: #ff7171;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; background: radial-gradient(circle at top, #0d2238, var(--bg));
+      color: var(--text); font-family: Arial, sans-serif; display: flex; justify-content: center; padding: 24px 14px;
+    }
+    .app { width: min(100%, 760px); }
+    .top { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 18px; }
+    h1 { margin: 0; font-size: clamp(1.6rem, 4vw, 2.5rem); }
+    .status-pill { padding: 8px 12px; border-radius: 999px; border: 1px solid var(--line); background: rgba(255,255,255,0.04); font-weight: 700; }
+    .panel { background: rgba(15, 28, 42, 0.96); border: 1px solid var(--line); border-radius: 16px; padding: 16px; margin-bottom: 18px; box-shadow: 0 10px 30px rgba(0,0,0,0.18); }
+    .grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+    .field { display: flex; flex-direction: column; gap: 8px; }
+    label { font-weight: 700; color: var(--muted); }
+    input, select, button { font: inherit; }
+    input[type="text"], input[type="password"] { width: 100%; border-radius: 10px; border: 1px solid var(--line); background: rgba(8,18,26,0.9); color: var(--text); padding: 11px 12px; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    button {
+      background: linear-gradient(135deg, var(--primary), var(--accent));
+      color: white; border: 0; border-radius: 10px; padding: 10px 14px; font-weight: 800; cursor: pointer;
+    }
+    button.secondary { background: rgba(255,255,255,0.06); border: 1px solid var(--line); }
+    button.danger { background: linear-gradient(135deg, #ff7272, #d95e93); }
+    .muted { color: var(--muted); }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+    .strength { display: inline-block; min-width: 68px; }
+    .strength[data-level="0"] { color: var(--muted); }
+    .strength[data-level="1"] { color: #ffbf69; }
+    .strength[data-level="2"] { color: #9ae8ff; }
+    .strength[data-level="3"] { color: var(--success); }
+    .hidden { display: none !important; }
+    .scan-status { color: var(--muted); font-size: 0.95rem; }
+    .list-btn { width: 100%; text-align: left; padding: 10px 12px; background: rgba(255,255,255,0.04); border: 1px solid var(--line); border-radius: 10px; color: var(--text); }
+    .list-btn strong { display: block; }
+    .footer { display: flex; justify-content: space-between; gap: 10px; margin-top: 12px; flex-wrap: wrap; }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="top">
+      <h1>Paludarium Wi‑Fi Setup</h1>
+      <div class="status-pill" id="ap-status">AP モード</div>
+    </div>
+
+    <div class="panel">
+      <div class="grid">
+        <div class="field"><label>端末ID</label><div id="device-id">-</div></div>
+        <div class="field"><label>ローカルURL</label><div id="local-hostname">-</div></div>
+        <div class="field"><label>設定用Wi-Fi名</label><div id="setup-ap-ssid">-</div></div>
+        <div class="field"><label>現在の接続状態</label><div id="conn-state">未接続</div></div>
+        <div class="field"><label>現在接続しているSSID</label><div id="current-ssid">-</div></div>
+        <div class="field"><label>現在のIPアドレス</label><div id="current-ip">-</div></div>
+      </div>
+      <div class="row" style="margin-top: 14px;">
+        <button type="button" id="scan-btn">周辺Wi‑Fiを検索</button>
+        <button type="button" class="secondary" id="refresh-saved-btn">保存済みWi‑Fiを更新</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="field" style="margin-bottom: 12px;">
+        <label>検出されたSSID一覧</label>
+        <div id="scan-status" class="scan-status">検索待ち</div>
+      </div>
+      <div id="scan-results" class="grid"></div>
+    </div>
+
+    <div class="panel">
+      <form id="wifi-form">
+        <div class="field" style="margin-bottom: 12px;">
+          <label for="ssid-input">SSID</label>
+          <input id="ssid-input" name="ssid" type="text" placeholder="Wi‑FiのSSID" />
+        </div>
+        <div class="field" style="margin-bottom: 12px;">
+          <label for="password-input">パスワード</label>
+          <div class="row" style="align-items: stretch;">
+            <input id="password-input" name="password" type="password" placeholder="Wi‑Fiパスワード" />
+            <button type="button" class="secondary" id="toggle-password-btn">表示</button>
+          </div>
+        </div>
+        <div class="row">
+          <button type="submit">接続して保存</button>
+        </div>
+      </form>
+    </div>
+
+    <div class="panel">
+      <div class="field" style="margin-bottom: 8px;">
+        <label>保存済みWi‑Fi一覧</label>
+      </div>
+      <div id="saved-networks"></div>
+    </div>
+
+    <div class="footer">
+      <button type="button" class="secondary" id="back-control-btn">制御画面へ戻る</button>
+      <button type="button" class="danger" id="clear-network-btn">保存済みWi‑Fiを消去</button>
+    </div>
+  </div>
+
+  <script>
+    function setStatus(el, value) {
+      document.getElementById(el).textContent = value || '-';
+    }
+
+    function updateStatusPanel() {
+      fetch('/status').then((r) => r.json()).then((data) => {
+        const connected = !!data.wifiConnected;
+        setStatus('device-id', data.deviceId || '-');
+        setStatus('local-hostname', data.hostname ? `http://${data.hostname}/` : '-');
+        setStatus('setup-ap-ssid', data.setupApSsid || '-');
+        setStatus('conn-state', connected ? '接続済み' : '未接続');
+        setStatus('current-ssid', data.ssid || '-');
+        setStatus('current-ip', data.ip || '-');
+        document.getElementById('ap-status').textContent = data.apMode ? 'AP モード' : 'STA モード';
+      }).catch(() => {
+        setStatus('conn-state', '状態取得失敗');
+      });
+    }
+
+    function renderScanResults(items) {
+      const container = document.getElementById('scan-results');
+      if (!items || !items.length) {
+        container.innerHTML = '<div class="muted">検索結果がありません。</div>';
+        return;
+      }
+
+      const rows = items.map((item) => {
+        const level = item.rssi > -60 ? 3 : item.rssi > -75 ? 2 : item.rssi > -90 ? 1 : 0;
+        return `
+          <button class="list-btn" data-ssid="${item.ssid.replace(/"/g, '&quot;')}" type="button">
+            <strong>${item.ssid}</strong>
+            <span class="muted">RSSI: ${item.rssi} dBm / ${item.secure ? '暗号化あり' : '暗号化なし'}</span>
+            <span class="strength" data-level="${level}">${item.rssi > -60 ? '強' : item.rssi > -75 ? '中' : item.rssi > -90 ? '弱' : '極弱'}</span>
+          </button>
+        `;
+      }).join('');
+
+      container.innerHTML = rows;
+      container.querySelectorAll('[data-ssid]').forEach((btn) => {
+        btn.addEventListener('click', () => {
+          const ssid = btn.getAttribute('data-ssid');
+          document.getElementById('ssid-input').value = ssid;
+        });
+      });
+    }
+
+    function loadScanResults() {
+      document.getElementById('scan-status').textContent = '検索中...';
+      fetch('/wifi/scan').then((r) => r.json()).then((data) => {
+        const items = Array.isArray(data) ? data : [];
+        renderScanResults(items);
+        document.getElementById('scan-status').textContent = items.length ? `${items.length}件のSSIDを検出しました` : '検出結果がありません';
+      }).catch(() => {
+        document.getElementById('scan-status').textContent = '検索に失敗しました';
+      });
+    }
+
+    function loadSavedNetworks() {
+      fetch('/wifi/saved').then((r) => r.json()).then((data) => {
+        const container = document.getElementById('saved-networks');
+        if (!Array.isArray(data) || data.length === 0) {
+          container.innerHTML = '<div class="muted">保存済みWi‑Fiはありません。</div>';
+          return;
+        }
+
+        container.innerHTML = data.map((item) => `
+          <div class="row" style="justify-content: space-between; margin-bottom: 8px; padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: rgba(255,255,255,0.03);">
+            <span>${item.ssid}</span>
+            <button type="button" class="danger" data-delete-id="${item.id}">削除</button>
+          </div>
+        `).join('');
+
+        container.querySelectorAll('[data-delete-id]').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            const id = btn.getAttribute('data-delete-id');
+            fetch('/wifi/delete?id=' + id).then(() => loadSavedNetworks()).then(() => updateStatusPanel());
+          });
+        });
+      }).catch(() => {
+        document.getElementById('saved-networks').innerHTML = '<div class="muted">保存済み一覧の取得に失敗しました。</div>';
+      });
+    }
+
+    document.getElementById('scan-btn').addEventListener('click', loadScanResults);
+    document.getElementById('refresh-saved-btn').addEventListener('click', loadSavedNetworks);
+    document.getElementById('toggle-password-btn').addEventListener('click', () => {
+      const input = document.getElementById('password-input');
+      const visible = input.type === 'text';
+      input.type = visible ? 'password' : 'text';
+      document.getElementById('toggle-password-btn').textContent = visible ? '表示' : '非表示';
+    });
+    document.getElementById('wifi-settings-btn')?.addEventListener('click', () => {
+      window.location.href = '/wifi';
+    });
+    document.getElementById('back-control-btn').addEventListener('click', () => {
+      window.location.href = '/';
+    });
+    document.getElementById('clear-network-btn').addEventListener('click', () => {
+      fetch('/wifi/saved').then((r) => r.json()).then((data) => {
+        if (!Array.isArray(data) || data.length === 0) return;
+        Promise.all(data.map((item) => fetch('/wifi/delete?id=' + item.id))).then(() => loadSavedNetworks());
+      });
+    });
+
+    document.getElementById('wifi-form').addEventListener('submit', (event) => {
+      event.preventDefault();
+      const ssid = document.getElementById('ssid-input').value.trim();
+      const password = document.getElementById('password-input').value;
+      if (!ssid) {
+        alert('SSIDを入力してください');
+        return;
+      }
+
+      const params = new URLSearchParams({ ssid, password });
+      fetch('/wifi/save?' + params.toString()).then((r) => r.json()).then((data) => {
+        alert(data.message || '保存しました。接続を試しています。');
+        loadSavedNetworks();
+        updateStatusPanel();
+      }).catch(() => alert('保存に失敗しました'));
+    });
+
+    updateStatusPanel();
+    loadSavedNetworks();
+    loadScanResults();
+    setInterval(updateStatusPanel, 5000);
+  </script>
+</body>
+</html>
+)rawliteral";
 
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
@@ -1447,7 +1872,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     <div class="topbar">
       <div class="brand">
         <span class="brand-mark" aria-hidden="true"></span>
-        <span>Paludarium Light</span>
+        <span id="device-label">Paludarium Light</span>
       </div>
       <div class="status-pill"><span class="status-dot"></span><span id="wifi-pill">192.168.0.31</span></div>
     </div>
@@ -1460,7 +1885,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         </div>
         <div>
           <div id="time" class="status-main">00:03</div>
-          <div id="date" class="status-sub">2025/06/01 (日)</div>
+          <div id="date" class="status-sub">----/--/-- (-)</div>
         </div>
       </div>
 
@@ -1648,7 +2073,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <button class="nav-btn primary"><span class="symbol">▣</span><span>コントロール</span></button>
       <button class="nav-btn"><span class="symbol">◌</span><span>プリセット</span></button>
       <button class="nav-btn"><span class="symbol">⏱</span><span>スケジュール</span></button>
-      <button class="nav-btn"><span class="symbol">⚙</span><span>設定</span></button>
+      <button class="nav-btn" id="wifi-settings-btn" type="button"><span class="symbol">⚙</span><span>設定</span></button>
     </div>
   </div>
 
@@ -1724,9 +2149,11 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         .then((data) => {
           loading = true;
           document.getElementById('time').textContent = data.time || '--:--';
+          document.getElementById('date').textContent = data.date || '----/--/-- (-)';
           document.getElementById('phase').textContent = data.phase || '--';
           document.getElementById('wifi').textContent = data.wifi || '未接続';
           document.getElementById('wifi-pill').textContent = data.wifi || '未接続';
+          document.getElementById('device-label').textContent = data.deviceId || 'Paludarium Light';
           window.currentWeather = Number(data.weather ?? 0);
           const modeValue = Number(data.mode ?? 1);
           document.getElementById('mode-auto').classList.toggle('active', modeValue === 0);
@@ -1986,11 +2413,20 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 )rawliteral";
 
 void handleRoot() {
+  if (apMode || !WiFi.isConnected()) {
+    server.send_P(200, "text/html; charset=utf-8", WIFI_SETUP_HTML);
+    return;
+  }
   server.send_P(200, "text/html; charset=utf-8", INDEX_HTML);
+}
+
+void handleWifiPage() {
+  server.send_P(200, "text/html; charset=utf-8", WIFI_SETUP_HTML);
 }
 
 void setupWebServer() {
   server.on("/", handleRoot);
+  server.on("/wifi", handleWifiPage);
   server.on("/status", handleStatus);
   server.on("/mode", handleMode);
   server.on("/weather", handleWeather);
@@ -2006,6 +2442,11 @@ void setupWebServer() {
   server.on("/wifi/delete", handleWifiDelete);
 
   server.onNotFound([]() {
+    if (apMode) {
+      server.sendHeader("Location", "/wifi", true);
+      server.send(302, "text/plain; charset=utf-8", "Redirecting to Wi‑Fi setup");
+      return;
+    }
     server.send(404, "text/plain; charset=utf-8", "Not Found");
   });
 
@@ -2017,34 +2458,109 @@ void setupWebServer() {
 // -----------------------------------------------------------------------------
 
 void startWiFi() {
+  Serial.println("[W1] startWiFi entered");
+  Serial.flush();
+
+  Serial.println("[W2] loadSavedNetworks start");
+  Serial.flush();
   loadSavedNetworks();
+  Serial.println("[W2] loadSavedNetworks OK");
+  Serial.flush();
+
+  Serial.println("[W3] WiFi.mode(WIFI_STA) start");
+  Serial.flush();
   WiFi.mode(WIFI_STA);
-  WiFi.hostname(HOSTNAME);
+  Serial.println("[W3] WiFi.mode(WIFI_STA) OK");
+  Serial.flush();
+
+  Serial.println("[W4] WiFi.hostname start");
+  Serial.flush();
+  WiFi.hostname(hostname.c_str());
+  Serial.println("[W4] WiFi.hostname OK");
+  Serial.flush();
+
+  Serial.println("[W5] WiFi.disconnect start");
+  Serial.flush();
   WiFi.disconnect(false);
+  Serial.println("[W5] WiFi.disconnect OK");
+  Serial.flush();
+
+  Serial.println("[W6] WiFi.scanDelete start");
+  Serial.flush();
+  WiFi.scanDelete();
+  Serial.println("[W6] WiFi.scanDelete OK");
+  Serial.flush();
+
+  if (!apMode) {
+    Serial.println("[W6A] triggerSetupMode start");
+    Serial.flush();
+    triggerSetupMode();
+    Serial.println("[W6A] triggerSetupMode OK");
+    Serial.flush();
+  }
+
   wifiScanPending = false;
   wifiState = WIFI_STATE_IDLE;
   wifiStateChangedMs = millis();
+  pendingWifiReconnectMs = 0;
+  pendingWifiReconnectSsid = "";
+  pendingWifiReconnectPassword = "";
+  savedNetworkAttemptIndex = 0;
+
+  Serial.print("[W7] savedNetworkCount = ");
+  Serial.println(savedNetworkCount);
+  Serial.flush();
+
+  Serial.print("[W8] secrets configured = ");
+  Serial.println(hasConfiguredSecretsWifi() ? "YES" : "NO");
+  Serial.flush();
 
   if (savedNetworkCount > 0) {
-    trySavedNetworks();
+    Serial.println("[W9] trySavedNetworks start");
+    Serial.flush();
+
+    const bool result = trySavedNetworks();
+
+    Serial.print("[W9] trySavedNetworks returned: ");
+    Serial.println(result ? "true" : "false");
+    Serial.flush();
     return;
   }
 
-  if (strlen(WIFI_SSID) > 0 && strcmp(WIFI_SSID, "YOUR_WIFI_SSID") != 0) {
-    wifiConnectSsid = WIFI_SSID;
-    wifiConnectPass = WIFI_PASSWORD;
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-    wifiState = WIFI_STATE_CONNECTING;
-    wifiStateChangedMs = millis();
+  if (hasConfiguredSecretsWifi()) {
+    Serial.println("[W10] attemptWifiConnection start");
+    Serial.flush();
+
+    attemptWifiConnection(WIFI_SSID, WIFI_PASSWORD);
+
+    Serial.println("[W10] attemptWifiConnection returned");
+    Serial.flush();
     return;
   }
 
-  startSetupAP();
-  wifiState = WIFI_STATE_FAILED;
-  wifiStateChangedMs = millis();
+  Serial.println("[W11] triggerSetupMode start");
+  Serial.flush();
+
+  triggerSetupMode();
+
+  Serial.println("[W11] triggerSetupMode returned");
+  Serial.flush();
 }
 
 void maintainWiFi() {
+  if (apMode) {
+    dnsServer.processNextRequest();
+  }
+
+  if (pendingWifiReconnectMs != 0 && millis() >= pendingWifiReconnectMs) {
+    if (pendingWifiReconnectSsid.length() > 0) {
+      attemptWifiConnection(pendingWifiReconnectSsid, pendingWifiReconnectPassword);
+    }
+    pendingWifiReconnectMs = 0;
+    pendingWifiReconnectSsid = "";
+    pendingWifiReconnectPassword = "";
+  }
+
   const wl_status_t currentStatus = WiFi.status();
 
   if (currentStatus == WL_CONNECTED) {
@@ -2071,21 +2587,27 @@ void maintainWiFi() {
   switch (wifiState) {
     case WIFI_STATE_IDLE:
       if (savedNetworkCount > 0) {
+        if (!apMode) {
+          triggerSetupMode();
+        }
         trySavedNetworks();
-      } else if (strlen(WIFI_SSID) > 0 && strcmp(WIFI_SSID, "YOUR_WIFI_SSID") != 0) {
-        wifiConnectSsid = WIFI_SSID;
-        wifiConnectPass = WIFI_PASSWORD;
-        WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-        wifiState = WIFI_STATE_CONNECTING;
-        wifiStateChangedMs = millis();
+      } else if (hasConfiguredSecretsWifi()) {
+        attemptWifiConnection(WIFI_SSID, WIFI_PASSWORD);
       } else if (!apMode) {
-        startSetupAP();
-        wifiState = WIFI_STATE_FAILED;
-        wifiStateChangedMs = millis();
+        triggerSetupMode();
       }
       return;
 
     case WIFI_STATE_SCAN_START:
+      if ((millis() - wifiStateChangedMs) >= WIFI_SCAN_TIMEOUT_MS) {
+        WiFi.scanDelete();
+        wifiScanPending = false;
+        wifiState = WIFI_STATE_IDLE;
+        wifiStateChangedMs = millis();
+        Serial.println("[SCAN] timeout, returning to idle");
+        Serial.flush();
+        return;
+      }
       WiFi.scanNetworks(true, true);
       wifiScanPending = true;
       wifiScanJsonCache = "[]";
@@ -2096,82 +2618,54 @@ void maintainWiFi() {
     case WIFI_STATE_SCANNING: {
       const int found = WiFi.scanComplete();
       if (found < 0) {
+        if ((millis() - wifiStateChangedMs) >= WIFI_SCAN_TIMEOUT_MS) {
+          WiFi.scanDelete();
+          wifiScanPending = false;
+          wifiState = WIFI_STATE_IDLE;
+          wifiStateChangedMs = millis();
+          Serial.println("[SCAN] timeout, continuing with AP mode");
+          Serial.flush();
+        }
         return;
       }
 
       wifiScanJsonCache = buildScanJson();
       wifiScanPending = false;
-
-      int bestIndex = -1;
-      int bestRssi = -9999;
-      for (int i = 0; i < found; ++i) {
-        for (uint8_t j = 0; j < savedNetworkCount; ++j) {
-          if (WiFi.SSID(i) == savedNetworks[j].ssid) {
-            if (WiFi.RSSI(i) > bestRssi) {
-              bestRssi = WiFi.RSSI(i);
-              bestIndex = j;
-            }
-          }
-        }
-      }
-
-      if (bestIndex >= 0) {
-        wifiConnectSsid = savedNetworks[bestIndex].ssid;
-        wifiConnectPass = savedNetworks[bestIndex].password;
-        Serial.print("Trying saved Wi-Fi: ");
-        Serial.println(wifiConnectSsid);
-        WiFi.begin(wifiConnectSsid.c_str(), wifiConnectPass.c_str());
-        wifiState = WIFI_STATE_CONNECTING;
-        wifiStateChangedMs = millis();
-      } else {
-        WiFi.scanDelete();
-        if (strlen(WIFI_SSID) > 0 && strcmp(WIFI_SSID, "YOUR_WIFI_SSID") != 0) {
-          wifiConnectSsid = WIFI_SSID;
-          wifiConnectPass = WIFI_PASSWORD;
-          WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-          wifiState = WIFI_STATE_CONNECTING;
-          wifiStateChangedMs = millis();
-        } else {
-          if (!apMode) {
-            startSetupAP();
-          }
-          wifiState = WIFI_STATE_FAILED;
-          wifiStateChangedMs = millis();
-        }
+      wifiState = (WiFi.status() == WL_CONNECTED) ? WIFI_STATE_CONNECTED : WIFI_STATE_FAILED;
+      wifiStateChangedMs = millis();
+      if (!apMode && WiFi.status() != WL_CONNECTED) {
+        triggerSetupMode();
       }
       return;
     }
 
     case WIFI_STATE_CONNECTING:
-      if (millis() - wifiStateChangedMs >= WIFI_RECONNECT_RETRY_MS) {
+      if ((millis() - wifiStateChangedMs) >= WIFI_SAVED_NETWORK_TIMEOUT_MS) {
         WiFi.disconnect(false);
-        if (savedNetworkCount > 0) {
+        savedNetworkAttemptIndex += 1;
+        if (savedNetworkAttemptIndex < savedNetworkCount) {
           trySavedNetworks();
-        } else if (strlen(WIFI_SSID) > 0 && strcmp(WIFI_SSID, "YOUR_WIFI_SSID") != 0) {
-          WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-          wifiState = WIFI_STATE_CONNECTING;
-          wifiStateChangedMs = millis();
-        } else if (!apMode) {
-          startSetupAP();
+          Serial.print("[W] retry saved network index: ");
+          Serial.println(savedNetworkAttemptIndex);
+          Serial.flush();
+        } else {
+          savedNetworkAttemptIndex = 0;
           wifiState = WIFI_STATE_FAILED;
           wifiStateChangedMs = millis();
+          if (!apMode) {
+            triggerSetupMode();
+          }
+          Serial.println("[W] all saved networks failed, AP remains available");
+          Serial.flush();
         }
       }
       return;
 
     case WIFI_STATE_FAILED:
-      if (millis() - wifiStateChangedMs >= WIFI_RECONNECT_RETRY_MS) {
-        if (savedNetworkCount > 0) {
-          trySavedNetworks();
-        } else if (strlen(WIFI_SSID) > 0 && strcmp(WIFI_SSID, "YOUR_WIFI_SSID") != 0) {
-          WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-          wifiState = WIFI_STATE_CONNECTING;
-          wifiStateChangedMs = millis();
-        } else if (!apMode) {
-          startSetupAP();
-          wifiStateChangedMs = millis();
-        }
+      if (apMode) {
+        return;
       }
+      triggerSetupMode();
       return;
 
     case WIFI_STATE_CONNECTED:
@@ -2186,26 +2680,54 @@ void maintainWiFi() {
 
 void setup() {
   Serial.begin(115200);
-  delay(200);
+  delay(500);
 
   Serial.println();
   Serial.println("Paludarium DMX controller starting...");
+  Serial.print("Reset reason code: ");
+  Serial.println(static_cast<int>(esp_reset_reason()));
 
+  // MAC由来の固有IDを、Wi-Fi・mDNS初期化より先に確定する。
+  initializeDeviceIdentity();
+
+  Serial.println("[1] loadSettings start");
   loadSettings();
+  Serial.println("[1] loadSettings OK");
 
   // DMXを最初に起動する。Wi-Fi接続待ちでDMXを止めない。
+  Serial.println("[2] setupDMX start");
   setupDMX();
+  Serial.println("[2] setupDMX OK");
+
+  Serial.println("[3] setupFan start");
   setupFan();
+  Serial.println("[3] setupFan OK");
+
+  Serial.println("[4] setupDosing start");
   setupDosing();
+  Serial.println("[4] setupDosing OK");
 
+  Serial.println("[5] loadSavedNetworks start");
   loadSavedNetworks();
-  startWiFi();
-  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
-  setupWebServer();
+  Serial.println("[5] loadSavedNetworks OK");
 
-  Serial.println("DMX started: TX=GPIO18, DE/RE=GPIO4");
-  Serial.println("Fan PWM: GPIO25 @ 50Hz / Dosing: GPIO26 OFF");
-  Serial.println("Initial output: Red=255, Master=255, MANUAL mode");
+  Serial.println("[6] startWiFi start");
+  startWiFi();
+  Serial.println("[6] startWiFi OK");
+
+  Serial.println("[7] configTime start");
+  configTime(
+    GMT_OFFSET_SEC,
+    DAYLIGHT_OFFSET_SEC,
+    NTP_SERVER
+  );
+  Serial.println("[7] configTime OK");
+
+  Serial.println("[8] setupWebServer start");
+  setupWebServer();
+  Serial.println("[8] setupWebServer OK");
+
+  Serial.println("SETUP COMPLETED");
 }
 
 void loop() {
