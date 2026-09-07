@@ -189,7 +189,9 @@ uint8_t autoFanStartMinute = 52;
 uint32_t autoFanDurationMs = 2000;
 uint8_t autoFanSpeed = 10;
 uint8_t autoLightStartMinutes[3] = {53, 54, 55};
+uint8_t autoLightStartSeconds[3] = {0, 0, 0};
 uint8_t autoFadeStartMinute = 59;
+uint8_t autoFadeStartSecond = 0;
 uint32_t autoFadeDurationMs = 60000;
 uint8_t autoFanOutputDuty = 0;
 
@@ -428,14 +430,25 @@ bool isAutoSettingsValid() {
   if (autoFanStartMinute > 59) return false;
   if (autoFanSpeed > 100) return false;
   if (autoFanDurationMs < 100 || autoFanDurationMs > 60000) return false;
-  if (autoFadeStartMinute > 59) return false;
+  if (autoFadeStartMinute > 59 || autoFadeStartSecond > 59) return false;
   if (autoFadeDurationMs < 1000 || autoFadeDurationMs > 60000) return false;
   if (autoLightStartMinutes[0] > 59 || autoLightStartMinutes[1] > 59 || autoLightStartMinutes[2] > 59) return false;
-  if (!(autoLightStartMinutes[0] < autoLightStartMinutes[1] &&
-        autoLightStartMinutes[1] < autoLightStartMinutes[2] &&
-        autoLightStartMinutes[2] < autoFadeStartMinute)) {
+  if (autoLightStartSeconds[0] > 59 || autoLightStartSeconds[1] > 59 || autoLightStartSeconds[2] > 59) return false;
+
+  const int light1Start = autoLightStartMinutes[0] * 60 + autoLightStartSeconds[0];
+  const int light2Start = autoLightStartMinutes[1] * 60 + autoLightStartSeconds[1];
+  const int light3Start = autoLightStartMinutes[2] * 60 + autoLightStartSeconds[2];
+  const int fadeStart = autoFadeStartMinute * 60 + autoFadeStartSecond;
+  const int fadeDurationSec = max(1, (autoFadeDurationMs + 999UL) / 1000UL);
+
+  if (!(light1Start < light2Start && light2Start < light3Start && light3Start < fadeStart)) {
     return false;
   }
+
+  if (fadeStart + fadeDurationSec > 3600) {
+    return false;
+  }
+
   return true;
 }
 
@@ -480,6 +493,7 @@ void updateAutomaticLight() {
 
   const int minute = timeinfo.tm_min;
   const int second = timeinfo.tm_sec;
+  const int secondOfHour = minute * 60 + second;
 
   if (!isAutoCycleWindowActive(timeinfo)) {
     for (size_t i = 0; i < FIXTURE_COUNT; ++i) {
@@ -499,10 +513,16 @@ void updateAutomaticLight() {
   const bool fanActive = (minute == autoFanStartMinute) && (second < fanDurationSeconds);
   setAutoFanOutput(fanActive);
 
-  const bool light1Enabled = (minute >= autoLightStartMinutes[0] && minute < autoFadeStartMinute);
-  const bool light2Enabled = (minute >= autoLightStartMinutes[1] && minute < autoFadeStartMinute);
-  const bool light3Enabled = (minute >= autoLightStartMinutes[2] && minute < autoFadeStartMinute);
-  const bool fadeOut = (minute == autoFadeStartMinute);
+  const int light1Start = autoLightStartMinutes[0] * 60 + autoLightStartSeconds[0];
+  const int light2Start = autoLightStartMinutes[1] * 60 + autoLightStartSeconds[1];
+  const int light3Start = autoLightStartMinutes[2] * 60 + autoLightStartSeconds[2];
+  const int fadeStart = autoFadeStartMinute * 60 + autoFadeStartSecond;
+  const uint32_t fadeDurationSeconds = max(1UL, (autoFadeDurationMs + 999UL) / 1000UL);
+
+  const bool light1Enabled = (secondOfHour >= light1Start && secondOfHour < fadeStart);
+  const bool light2Enabled = (secondOfHour >= light2Start && secondOfHour < fadeStart);
+  const bool light3Enabled = (secondOfHour >= light3Start && secondOfHour < fadeStart);
+  const bool fadeOut = (secondOfHour >= fadeStart && secondOfHour < fadeStart + static_cast<int>(fadeDurationSeconds));
 
   for (size_t i = 0; i < FIXTURE_COUNT; ++i) {
     bool fixtureEnabled = false;
@@ -528,7 +548,8 @@ void updateAutomaticLight() {
 
     if (fadeOut) {
       const float fadeWindowSec = static_cast<float>(max(1UL, autoFadeDurationMs / 1000UL));
-      const float fadeProgress = constrain(static_cast<float>(second) / fadeWindowSec, 0.0f, 1.0f);
+      const float fadeElapsed = static_cast<float>(max(0, secondOfHour - fadeStart));
+      const float fadeProgress = constrain(fadeElapsed / fadeWindowSec, 0.0f, 1.0f);
       const float remainingRatio = 1.0f - fadeProgress;
       const uint8_t fadedMaster = static_cast<uint8_t>(lroundf(static_cast<float>(source.master) * remainingRatio));
       fixtures[i].master = fadedMaster;
@@ -557,7 +578,11 @@ void loadAutoSettings() {
   autoLightStartMinutes[0] = preferences.getUChar("auto_l1_min", autoLightStartMinutes[0]);
   autoLightStartMinutes[1] = preferences.getUChar("auto_l2_min", autoLightStartMinutes[1]);
   autoLightStartMinutes[2] = preferences.getUChar("auto_l3_min", autoLightStartMinutes[2]);
+  autoLightStartSeconds[0] = preferences.getUChar("auto_l1_sec", autoLightStartSeconds[0]);
+  autoLightStartSeconds[1] = preferences.getUChar("auto_l2_sec", autoLightStartSeconds[1]);
+  autoLightStartSeconds[2] = preferences.getUChar("auto_l3_sec", autoLightStartSeconds[2]);
   autoFadeStartMinute = preferences.getUChar("auto_fade_min", autoFadeStartMinute);
+  autoFadeStartSecond = preferences.getUChar("auto_fade_sec", autoFadeStartSecond);
   autoFadeDurationMs = preferences.getULong("auto_fade_ms", autoFadeDurationMs);
 
   if (!isAutoSettingsValid()) {
@@ -569,7 +594,11 @@ void loadAutoSettings() {
     autoLightStartMinutes[0] = 53;
     autoLightStartMinutes[1] = 54;
     autoLightStartMinutes[2] = 55;
+    autoLightStartSeconds[0] = 0;
+    autoLightStartSeconds[1] = 0;
+    autoLightStartSeconds[2] = 0;
     autoFadeStartMinute = 59;
+    autoFadeStartSecond = 0;
     autoFadeDurationMs = 60000;
   }
 
@@ -590,7 +619,11 @@ void saveAutoSettingsToPreferences() {
   preferences.putUChar("auto_l1_min", autoLightStartMinutes[0]);
   preferences.putUChar("auto_l2_min", autoLightStartMinutes[1]);
   preferences.putUChar("auto_l3_min", autoLightStartMinutes[2]);
+  preferences.putUChar("auto_l1_sec", autoLightStartSeconds[0]);
+  preferences.putUChar("auto_l2_sec", autoLightStartSeconds[1]);
+  preferences.putUChar("auto_l3_sec", autoLightStartSeconds[2]);
   preferences.putUChar("auto_fade_min", autoFadeStartMinute);
+  preferences.putUChar("auto_fade_sec", autoFadeStartSecond);
   preferences.putULong("auto_fade_ms", autoFadeDurationMs);
   preferences.end();
 }
@@ -1051,9 +1084,13 @@ void handleStatus() {
   json += "\"autoFanDurationMs\":" + String(autoFanDurationMs) + ",";
   json += "\"autoFanSpeed\":" + String(autoFanSpeed) + ",";
   json += "\"autoL1Min\":" + String(autoLightStartMinutes[0]) + ",";
+  json += "\"autoL1Sec\":" + String(autoLightStartSeconds[0]) + ",";
   json += "\"autoL2Min\":" + String(autoLightStartMinutes[1]) + ",";
+  json += "\"autoL2Sec\":" + String(autoLightStartSeconds[1]) + ",";
   json += "\"autoL3Min\":" + String(autoLightStartMinutes[2]) + ",";
+  json += "\"autoL3Sec\":" + String(autoLightStartSeconds[2]) + ",";
   json += "\"autoFadeStartMinute\":" + String(autoFadeStartMinute) + ",";
+  json += "\"autoFadeStartSecond\":" + String(autoFadeStartSecond) + ",";
   json += "\"autoFadeDurationMs\":" + String(autoFadeDurationMs) + ",";
   json += "\"dosing\":" + String(dosingActive ? "true" : "false") + ",";
   json += "\"dosingDurationMs\":" + String(dosingDurationMs) + ",";
@@ -1292,9 +1329,13 @@ void handleAutoSettings() {
     json += "\"fanDurationMs\":" + String(autoFanDurationMs) + ",";
     json += "\"fanSpeed\":" + String(autoFanSpeed) + ",";
     json += "\"light1Min\":" + String(autoLightStartMinutes[0]) + ",";
+    json += "\"light1Sec\":" + String(autoLightStartSeconds[0]) + ",";
     json += "\"light2Min\":" + String(autoLightStartMinutes[1]) + ",";
+    json += "\"light2Sec\":" + String(autoLightStartSeconds[1]) + ",";
     json += "\"light3Min\":" + String(autoLightStartMinutes[2]) + ",";
+    json += "\"light3Sec\":" + String(autoLightStartSeconds[2]) + ",";
     json += "\"fadeStartMinute\":" + String(autoFadeStartMinute) + ",";
+    json += "\"fadeStartSecond\":" + String(autoFadeStartSecond) + ",";
     json += "\"fadeDurationMs\":" + String(autoFadeDurationMs) + "}";
     server.send(200, "application/json; charset=utf-8", json);
     return;
@@ -1308,7 +1349,11 @@ void handleAutoSettings() {
   const int light1Min = server.hasArg("light1Min") ? server.arg("light1Min").toInt() : autoLightStartMinutes[0];
   const int light2Min = server.hasArg("light2Min") ? server.arg("light2Min").toInt() : autoLightStartMinutes[1];
   const int light3Min = server.hasArg("light3Min") ? server.arg("light3Min").toInt() : autoLightStartMinutes[2];
+  const int light1Sec = server.hasArg("light1Sec") ? server.arg("light1Sec").toInt() : autoLightStartSeconds[0];
+  const int light2Sec = server.hasArg("light2Sec") ? server.arg("light2Sec").toInt() : autoLightStartSeconds[1];
+  const int light3Sec = server.hasArg("light3Sec") ? server.arg("light3Sec").toInt() : autoLightStartSeconds[2];
   const int fadeStartMinute = server.hasArg("fadeStartMinute") ? server.arg("fadeStartMinute").toInt() : autoFadeStartMinute;
+  const int fadeStartSecond = server.hasArg("fadeStartSecond") ? server.arg("fadeStartSecond").toInt() : autoFadeStartSecond;
   const int fadeDurationMs = server.hasArg("fadeDurationMs") ? server.arg("fadeDurationMs").toInt() : autoFadeDurationMs;
 
   if (startHour < 0 || startHour > 23 || endHour < 0 || endHour > 23 ||
@@ -1316,19 +1361,32 @@ void handleAutoSettings() {
       fanSpeedPct < 0 || fanSpeedPct > 100 ||
       fanDurationMs < 100 || fanDurationMs > 60000 ||
       light1Min < 0 || light1Min > 59 || light2Min < 0 || light2Min > 59 ||
-      light3Min < 0 || light3Min > 59 || fadeStartMinute < 0 || fadeStartMinute > 59 ||
+      light3Min < 0 || light3Min > 59 || light1Sec < 0 || light1Sec > 59 ||
+      light2Sec < 0 || light2Sec > 59 || light3Sec < 0 || light3Sec > 59 ||
+      fadeStartMinute < 0 || fadeStartMinute > 59 || fadeStartSecond < 0 || fadeStartSecond > 59 ||
       fadeDurationMs < 1000 || fadeDurationMs > 60000) {
     server.send(400, "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"AUTO設定の値が範囲外です\"}");
     return;
   }
+
+  const int light1Start = light1Min * 60 + light1Sec;
+  const int light2Start = light2Min * 60 + light2Sec;
+  const int light3Start = light3Min * 60 + light3Sec;
+  const int fadeStart = fadeStartMinute * 60 + fadeStartSecond;
+  const int fadeDurationSec = max(1, (fadeDurationMs + 999UL) / 1000UL);
 
   if (startHour >= endHour) {
     server.send(400, "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"運転開始時刻は終了時刻より前である必要があります\"}");
     return;
   }
 
-  if (!(light1Min < light2Min && light2Min < light3Min && light3Min < fadeStartMinute)) {
-    server.send(400, "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"LIGHT1 < LIGHT2 < LIGHT3 < フェード開始分 の順序で設定してください\"}");
+  if (!(light1Start < light2Start && light2Start < light3Start && light3Start < fadeStart)) {
+    server.send(400, "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"LIGHT1 < LIGHT2 < LIGHT3 < フェード開始時刻 の順序で設定してください\"}");
+    return;
+  }
+
+  if (fadeStart + fadeDurationSec > 3600) {
+    server.send(400, "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"フェード開始時刻＋フェード時間は 60:00 を超えないように設定してください\"}");
     return;
   }
 
@@ -1340,13 +1398,17 @@ void handleAutoSettings() {
   autoLightStartMinutes[0] = static_cast<uint8_t>(light1Min);
   autoLightStartMinutes[1] = static_cast<uint8_t>(light2Min);
   autoLightStartMinutes[2] = static_cast<uint8_t>(light3Min);
+  autoLightStartSeconds[0] = static_cast<uint8_t>(light1Sec);
+  autoLightStartSeconds[1] = static_cast<uint8_t>(light2Sec);
+  autoLightStartSeconds[2] = static_cast<uint8_t>(light3Sec);
   autoFadeStartMinute = static_cast<uint8_t>(fadeStartMinute);
+  autoFadeStartSecond = static_cast<uint8_t>(fadeStartSecond);
   autoFadeDurationMs = static_cast<uint32_t>(fadeDurationMs);
 
   saveAutoSettingsToPreferences();
   updateAutomaticLight();
 
-  String json = "{\"ok\":true,\"startHour\":" + String(autoStartHour) + ",\"endHour\":" + String(autoEndHour) + ",\"fanStartMinute\":" + String(autoFanStartMinute) + ",\"fanDurationMs\":" + String(autoFanDurationMs) + ",\"fanSpeed\":" + String(autoFanSpeed) + ",\"light1Min\":" + String(autoLightStartMinutes[0]) + ",\"light2Min\":" + String(autoLightStartMinutes[1]) + ",\"light3Min\":" + String(autoLightStartMinutes[2]) + ",\"fadeStartMinute\":" + String(autoFadeStartMinute) + ",\"fadeDurationMs\":" + String(autoFadeDurationMs) + "}";
+  String json = "{\"ok\":true,\"startHour\":" + String(autoStartHour) + ",\"endHour\":" + String(autoEndHour) + ",\"fanStartMinute\":" + String(autoFanStartMinute) + ",\"fanDurationMs\":" + String(autoFanDurationMs) + ",\"fanSpeed\":" + String(autoFanSpeed) + ",\"light1Min\":" + String(autoLightStartMinutes[0]) + ",\"light1Sec\":" + String(autoLightStartSeconds[0]) + ",\"light2Min\":" + String(autoLightStartMinutes[1]) + ",\"light2Sec\":" + String(autoLightStartSeconds[1]) + ",\"light3Min\":" + String(autoLightStartMinutes[2]) + ",\"light3Sec\":" + String(autoLightStartSeconds[2]) + ",\"fadeStartMinute\":" + String(autoFadeStartMinute) + ",\"fadeStartSecond\":" + String(autoFadeStartSecond) + ",\"fadeDurationMs\":" + String(autoFadeDurationMs) + "}";
   server.send(200, "application/json; charset=utf-8", json);
 }
 
@@ -2297,21 +2359,25 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
             <label class="label" for="auto-fan-pct">AUTOファン出力</label>
             <input id="auto-fan-pct" type="number" min="0" max="100" value="10" style="width: 100%; border-radius: 10px; border: 1px solid var(--border); background: rgba(15,23,32,0.9); color: var(--text); padding: 8px 10px; font-weight:700; text-align:center;">
           </div>
-          <div class="level-row" style="grid-template-columns: 1fr 1fr; gap: 10px;">
+          <div class="level-row" style="grid-template-columns: 1fr 1fr 1fr; gap: 10px;">
             <label class="label" for="auto-l1-min">LIGHT 1</label>
             <input id="auto-l1-min" type="number" min="0" max="59" value="53" style="width: 100%; border-radius: 10px; border: 1px solid var(--border); background: rgba(15,23,32,0.9); color: var(--text); padding: 8px 10px; font-weight:700; text-align:center;">
+            <input id="auto-l1-sec" type="number" min="0" max="59" value="0" style="width: 100%; border-radius: 10px; border: 1px solid var(--border); background: rgba(15,23,32,0.9); color: var(--text); padding: 8px 10px; font-weight:700; text-align:center;">
           </div>
-          <div class="level-row" style="grid-template-columns: 1fr 1fr; gap: 10px;">
+          <div class="level-row" style="grid-template-columns: 1fr 1fr 1fr; gap: 10px;">
             <label class="label" for="auto-l2-min">LIGHT 2</label>
             <input id="auto-l2-min" type="number" min="0" max="59" value="54" style="width: 100%; border-radius: 10px; border: 1px solid var(--border); background: rgba(15,23,32,0.9); color: var(--text); padding: 8px 10px; font-weight:700; text-align:center;">
+            <input id="auto-l2-sec" type="number" min="0" max="59" value="0" style="width: 100%; border-radius: 10px; border: 1px solid var(--border); background: rgba(15,23,32,0.9); color: var(--text); padding: 8px 10px; font-weight:700; text-align:center;">
           </div>
-          <div class="level-row" style="grid-template-columns: 1fr 1fr; gap: 10px;">
+          <div class="level-row" style="grid-template-columns: 1fr 1fr 1fr; gap: 10px;">
             <label class="label" for="auto-l3-min">LIGHT 3</label>
             <input id="auto-l3-min" type="number" min="0" max="59" value="55" style="width: 100%; border-radius: 10px; border: 1px solid var(--border); background: rgba(15,23,32,0.9); color: var(--text); padding: 8px 10px; font-weight:700; text-align:center;">
+            <input id="auto-l3-sec" type="number" min="0" max="59" value="0" style="width: 100%; border-radius: 10px; border: 1px solid var(--border); background: rgba(15,23,32,0.9); color: var(--text); padding: 8px 10px; font-weight:700; text-align:center;">
           </div>
-          <div class="level-row" style="grid-template-columns: 1fr 1fr; gap: 10px;">
-            <label class="label" for="auto-fade-min">フェード開始分</label>
+          <div class="level-row" style="grid-template-columns: 1fr 1fr 1fr; gap: 10px;">
+            <label class="label" for="auto-fade-min">フェード開始</label>
             <input id="auto-fade-min" type="number" min="0" max="59" value="59" style="width: 100%; border-radius: 10px; border: 1px solid var(--border); background: rgba(15,23,32,0.9); color: var(--text); padding: 8px 10px; font-weight:700; text-align:center;">
+            <input id="auto-fade-sec" type="number" min="0" max="59" value="0" style="width: 100%; border-radius: 10px; border: 1px solid var(--border); background: rgba(15,23,32,0.9); color: var(--text); padding: 8px 10px; font-weight:700; text-align:center;">
           </div>
           <div class="level-row" style="grid-template-columns: 1fr 1fr; gap: 10px;">
             <label class="label" for="auto-fade-ms">フェード時間(秒)</label>
@@ -2567,9 +2633,13 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         'auto-fan-ms': data.autoFanDurationMs ?? 2000,
         'auto-fan-pct': data.autoFanSpeed ?? 10,
         'auto-l1-min': data.autoL1Min ?? 53,
+        'auto-l1-sec': data.autoL1Sec ?? 0,
         'auto-l2-min': data.autoL2Min ?? 54,
+        'auto-l2-sec': data.autoL2Sec ?? 0,
         'auto-l3-min': data.autoL3Min ?? 55,
+        'auto-l3-sec': data.autoL3Sec ?? 0,
         'auto-fade-min': data.autoFadeStartMinute ?? 59,
+        'auto-fade-sec': data.autoFadeStartSecond ?? 0,
         'auto-fade-ms': data.autoFadeDurationMs ?? 60000
       };
 
@@ -2684,9 +2754,13 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         fanDurationMs: document.getElementById('auto-fan-ms').value,
         fanSpeed: document.getElementById('auto-fan-pct').value,
         light1Min: document.getElementById('auto-l1-min').value,
+        light1Sec: document.getElementById('auto-l1-sec').value,
         light2Min: document.getElementById('auto-l2-min').value,
+        light2Sec: document.getElementById('auto-l2-sec').value,
         light3Min: document.getElementById('auto-l3-min').value,
+        light3Sec: document.getElementById('auto-l3-sec').value,
         fadeStartMinute: document.getElementById('auto-fade-min').value,
+        fadeStartSecond: document.getElementById('auto-fade-sec').value,
         fadeDurationMs: document.getElementById('auto-fade-ms').value
       });
 
