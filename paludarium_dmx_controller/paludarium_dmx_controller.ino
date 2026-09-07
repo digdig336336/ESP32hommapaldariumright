@@ -183,6 +183,16 @@ int mode = 1;
 // weather: 0=Sunny, 1=Cloudy, 2=Rain
 int weather = 0;
 
+uint8_t autoStartHour = 8;
+uint8_t autoEndHour = 17;
+uint8_t autoFanStartMinute = 52;
+uint32_t autoFanDurationMs = 2000;
+uint8_t autoFanSpeed = 10;
+uint8_t autoLightStartMinutes[3] = {53, 54, 55};
+uint8_t autoFadeStartMinute = 59;
+uint32_t autoFadeDurationMs = 60000;
+uint8_t autoFanOutputDuty = 0;
+
 // GPIO25 = 5V fan control (via external MOSFET)
 constexpr int FAN_PIN = 25;
 constexpr int FAN_PWM_CHANNEL = 0;
@@ -412,17 +422,39 @@ void updateTimeDisplay() {
   }
 }
 
+bool isAutoSettingsValid() {
+  if (autoStartHour > 23 || autoEndHour > 23) return false;
+  if (autoStartHour >= autoEndHour) return false;
+  if (autoFanStartMinute > 59) return false;
+  if (autoFanSpeed > 100) return false;
+  if (autoFanDurationMs < 100 || autoFanDurationMs > 60000) return false;
+  if (autoFadeStartMinute > 59) return false;
+  if (autoFadeDurationMs < 1000 || autoFadeDurationMs > 60000) return false;
+  if (autoLightStartMinutes[0] > 59 || autoLightStartMinutes[1] > 59 || autoLightStartMinutes[2] > 59) return false;
+  if (!(autoLightStartMinutes[0] < autoLightStartMinutes[1] &&
+        autoLightStartMinutes[1] < autoLightStartMinutes[2] &&
+        autoLightStartMinutes[2] < autoFadeStartMinute)) {
+    return false;
+  }
+  return true;
+}
+
 bool isAutoCycleWindowActive(const struct tm& timeinfo) {
   const int secondsOfDay = (timeinfo.tm_hour * 3600) + (timeinfo.tm_min * 60) + timeinfo.tm_sec;
-  const int cycleStartSec = 8 * 3600;
-  const int cycleEndSec = (17 * 3600) - 1;
-  return secondsOfDay >= cycleStartSec && secondsOfDay <= cycleEndSec;
+  const int cycleStartSec = autoStartHour * 3600;
+  const int cycleEndSec = autoEndHour * 3600;
+
+  if (autoEndHour == 0) {
+    return secondsOfDay >= cycleStartSec && secondsOfDay < 86400;
+  }
+
+  return secondsOfDay >= cycleStartSec && secondsOfDay < cycleEndSec;
 }
 
 void setAutoFanOutput(bool active) {
-  const uint8_t targetSpeed = active ? 10 : 0;
-  fanSpeed = targetSpeed;
-  ledcWrite(FAN_PIN, active ? map(targetSpeed, 0, 100, 0, 255) : 0);
+  const uint8_t duty = active ? map(autoFanSpeed, 0, 100, 0, 255) : 0;
+  autoFanOutputDuty = duty;
+  ledcWrite(FAN_PIN, duty);
 }
 
 void updateAutomaticLight() {
@@ -463,13 +495,14 @@ void updateAutomaticLight() {
     return;
   }
 
-  const bool fanActive = (minute == 52) && (second < 2);
+  const uint8_t fanDurationSeconds = static_cast<uint8_t>(max(1UL, (autoFanDurationMs + 999UL) / 1000UL));
+  const bool fanActive = (minute == autoFanStartMinute) && (second < fanDurationSeconds);
   setAutoFanOutput(fanActive);
 
-  const bool light1Enabled = (minute >= 53 && minute < 59);
-  const bool light2Enabled = (minute >= 54 && minute < 59);
-  const bool light3Enabled = (minute >= 55 && minute < 59);
-  const bool fadeOut = (minute == 59);
+  const bool light1Enabled = (minute >= autoLightStartMinutes[0] && minute < autoFadeStartMinute);
+  const bool light2Enabled = (minute >= autoLightStartMinutes[1] && minute < autoFadeStartMinute);
+  const bool light3Enabled = (minute >= autoLightStartMinutes[2] && minute < autoFadeStartMinute);
+  const bool fadeOut = (minute == autoFadeStartMinute);
 
   for (size_t i = 0; i < FIXTURE_COUNT; ++i) {
     bool fixtureEnabled = false;
@@ -494,7 +527,8 @@ void updateAutomaticLight() {
     fixtures[i].white = source.white;
 
     if (fadeOut) {
-      const float fadeProgress = static_cast<float>(second) / 60.0f;
+      const float fadeWindowSec = static_cast<float>(max(1UL, autoFadeDurationMs / 1000UL));
+      const float fadeProgress = constrain(static_cast<float>(second) / fadeWindowSec, 0.0f, 1.0f);
       const float remainingRatio = 1.0f - fadeProgress;
       const uint8_t fadedMaster = static_cast<uint8_t>(lroundf(static_cast<float>(source.master) * remainingRatio));
       fixtures[i].master = fadedMaster;
@@ -510,6 +544,55 @@ void updateAutomaticLight() {
 void markSettingsDirty() {
   settingsDirty = true;
   lastSettingsChangeMs = millis();
+}
+
+void loadAutoSettings() {
+  preferences.begin("paludarium", false);
+
+  autoStartHour = preferences.getUChar("auto_start_h", autoStartHour);
+  autoEndHour = preferences.getUChar("auto_end_h", autoEndHour);
+  autoFanStartMinute = preferences.getUChar("auto_fan_min", autoFanStartMinute);
+  autoFanDurationMs = preferences.getULong("auto_fan_ms", autoFanDurationMs);
+  autoFanSpeed = preferences.getUChar("auto_fan_pct", autoFanSpeed);
+  autoLightStartMinutes[0] = preferences.getUChar("auto_l1_min", autoLightStartMinutes[0]);
+  autoLightStartMinutes[1] = preferences.getUChar("auto_l2_min", autoLightStartMinutes[1]);
+  autoLightStartMinutes[2] = preferences.getUChar("auto_l3_min", autoLightStartMinutes[2]);
+  autoFadeStartMinute = preferences.getUChar("auto_fade_min", autoFadeStartMinute);
+  autoFadeDurationMs = preferences.getULong("auto_fade_ms", autoFadeDurationMs);
+
+  if (!isAutoSettingsValid()) {
+    autoStartHour = 8;
+    autoEndHour = 17;
+    autoFanStartMinute = 52;
+    autoFanDurationMs = 2000;
+    autoFanSpeed = 10;
+    autoLightStartMinutes[0] = 53;
+    autoLightStartMinutes[1] = 54;
+    autoLightStartMinutes[2] = 55;
+    autoFadeStartMinute = 59;
+    autoFadeDurationMs = 60000;
+  }
+
+  preferences.end();
+}
+
+void saveAutoSettingsToPreferences() {
+  if (!isAutoSettingsValid()) {
+    return;
+  }
+
+  preferences.begin("paludarium", false);
+  preferences.putUChar("auto_start_h", autoStartHour);
+  preferences.putUChar("auto_end_h", autoEndHour);
+  preferences.putUChar("auto_fan_min", autoFanStartMinute);
+  preferences.putULong("auto_fan_ms", autoFanDurationMs);
+  preferences.putUChar("auto_fan_pct", autoFanSpeed);
+  preferences.putUChar("auto_l1_min", autoLightStartMinutes[0]);
+  preferences.putUChar("auto_l2_min", autoLightStartMinutes[1]);
+  preferences.putUChar("auto_l3_min", autoLightStartMinutes[2]);
+  preferences.putUChar("auto_fade_min", autoFadeStartMinute);
+  preferences.putULong("auto_fade_ms", autoFadeDurationMs);
+  preferences.end();
 }
 
 void loadSettings() {
@@ -557,11 +640,13 @@ void loadSettings() {
     dosingDurationMs = preferences.getULong("dosing_ms", dosingDurationMs);
   }
 
+  preferences.end();
+  loadAutoSettings();
+
   for (size_t i = 0; i < FIXTURE_COUNT; ++i) {
     fixtures[i] = manualFixtures[i];
   }
   updateSelectedFixtureState();
-  preferences.end();
 }
 
 void saveSettings() {
@@ -957,8 +1042,19 @@ void handleStatus() {
   }
   json += "],";
   json += "\"fan\":" + String(fanSpeed) + ",";
+  json += "\"autoFanOutput\":" + String(autoFanOutputDuty) + ",";
   json += "\"mode\":" + String(mode) + ",";
   json += "\"weather\":" + String(weather) + ",";
+  json += "\"autoStartHour\":" + String(autoStartHour) + ",";
+  json += "\"autoEndHour\":" + String(autoEndHour) + ",";
+  json += "\"autoFanStartMinute\":" + String(autoFanStartMinute) + ",";
+  json += "\"autoFanDurationMs\":" + String(autoFanDurationMs) + ",";
+  json += "\"autoFanSpeed\":" + String(autoFanSpeed) + ",";
+  json += "\"autoL1Min\":" + String(autoLightStartMinutes[0]) + ",";
+  json += "\"autoL2Min\":" + String(autoLightStartMinutes[1]) + ",";
+  json += "\"autoL3Min\":" + String(autoLightStartMinutes[2]) + ",";
+  json += "\"autoFadeStartMinute\":" + String(autoFadeStartMinute) + ",";
+  json += "\"autoFadeDurationMs\":" + String(autoFadeDurationMs) + ",";
   json += "\"dosing\":" + String(dosingActive ? "true" : "false") + ",";
   json += "\"dosingDurationMs\":" + String(dosingDurationMs) + ",";
   json += "\"dosingRemainingMs\":" + String(getDosingRemainingMs()) + ",";
@@ -1184,6 +1280,74 @@ void handleWeather() {
   if (mode == 0) updateAutomaticLight();
   markSettingsDirty();
   server.send(200, "text/plain; charset=utf-8", "OK");
+}
+
+void handleAutoSettings() {
+  if (server.method() == HTTP_GET) {
+    String json = "{";
+    json += "\"ok\":true,";
+    json += "\"startHour\":" + String(autoStartHour) + ",";
+    json += "\"endHour\":" + String(autoEndHour) + ",";
+    json += "\"fanStartMinute\":" + String(autoFanStartMinute) + ",";
+    json += "\"fanDurationMs\":" + String(autoFanDurationMs) + ",";
+    json += "\"fanSpeed\":" + String(autoFanSpeed) + ",";
+    json += "\"light1Min\":" + String(autoLightStartMinutes[0]) + ",";
+    json += "\"light2Min\":" + String(autoLightStartMinutes[1]) + ",";
+    json += "\"light3Min\":" + String(autoLightStartMinutes[2]) + ",";
+    json += "\"fadeStartMinute\":" + String(autoFadeStartMinute) + ",";
+    json += "\"fadeDurationMs\":" + String(autoFadeDurationMs) + "}";
+    server.send(200, "application/json; charset=utf-8", json);
+    return;
+  }
+
+  const int startHour = server.hasArg("startHour") ? server.arg("startHour").toInt() : autoStartHour;
+  const int endHour = server.hasArg("endHour") ? server.arg("endHour").toInt() : autoEndHour;
+  const int fanStartMinute = server.hasArg("fanStartMinute") ? server.arg("fanStartMinute").toInt() : autoFanStartMinute;
+  const int fanDurationMs = server.hasArg("fanDurationMs") ? server.arg("fanDurationMs").toInt() : autoFanDurationMs;
+  const int fanSpeedPct = server.hasArg("fanSpeed") ? server.arg("fanSpeed").toInt() : autoFanSpeed;
+  const int light1Min = server.hasArg("light1Min") ? server.arg("light1Min").toInt() : autoLightStartMinutes[0];
+  const int light2Min = server.hasArg("light2Min") ? server.arg("light2Min").toInt() : autoLightStartMinutes[1];
+  const int light3Min = server.hasArg("light3Min") ? server.arg("light3Min").toInt() : autoLightStartMinutes[2];
+  const int fadeStartMinute = server.hasArg("fadeStartMinute") ? server.arg("fadeStartMinute").toInt() : autoFadeStartMinute;
+  const int fadeDurationMs = server.hasArg("fadeDurationMs") ? server.arg("fadeDurationMs").toInt() : autoFadeDurationMs;
+
+  if (startHour < 0 || startHour > 23 || endHour < 0 || endHour > 23 ||
+      fanStartMinute < 0 || fanStartMinute > 59 ||
+      fanSpeedPct < 0 || fanSpeedPct > 100 ||
+      fanDurationMs < 100 || fanDurationMs > 60000 ||
+      light1Min < 0 || light1Min > 59 || light2Min < 0 || light2Min > 59 ||
+      light3Min < 0 || light3Min > 59 || fadeStartMinute < 0 || fadeStartMinute > 59 ||
+      fadeDurationMs < 1000 || fadeDurationMs > 60000) {
+    server.send(400, "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"AUTO設定の値が範囲外です\"}");
+    return;
+  }
+
+  if (startHour >= endHour) {
+    server.send(400, "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"運転開始時刻は終了時刻より前である必要があります\"}");
+    return;
+  }
+
+  if (!(light1Min < light2Min && light2Min < light3Min && light3Min < fadeStartMinute)) {
+    server.send(400, "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"LIGHT1 < LIGHT2 < LIGHT3 < フェード開始分 の順序で設定してください\"}");
+    return;
+  }
+
+  autoStartHour = static_cast<uint8_t>(startHour);
+  autoEndHour = static_cast<uint8_t>(endHour);
+  autoFanStartMinute = static_cast<uint8_t>(fanStartMinute);
+  autoFanDurationMs = static_cast<uint32_t>(fanDurationMs);
+  autoFanSpeed = static_cast<uint8_t>(fanSpeedPct);
+  autoLightStartMinutes[0] = static_cast<uint8_t>(light1Min);
+  autoLightStartMinutes[1] = static_cast<uint8_t>(light2Min);
+  autoLightStartMinutes[2] = static_cast<uint8_t>(light3Min);
+  autoFadeStartMinute = static_cast<uint8_t>(fadeStartMinute);
+  autoFadeDurationMs = static_cast<uint32_t>(fadeDurationMs);
+
+  saveAutoSettingsToPreferences();
+  updateAutomaticLight();
+
+  String json = "{\"ok\":true,\"startHour\":" + String(autoStartHour) + ",\"endHour\":" + String(autoEndHour) + ",\"fanStartMinute\":" + String(autoFanStartMinute) + ",\"fanDurationMs\":" + String(autoFanDurationMs) + ",\"fanSpeed\":" + String(autoFanSpeed) + ",\"light1Min\":" + String(autoLightStartMinutes[0]) + ",\"light2Min\":" + String(autoLightStartMinutes[1]) + ",\"light3Min\":" + String(autoLightStartMinutes[2]) + ",\"fadeStartMinute\":" + String(autoFadeStartMinute) + ",\"fadeDurationMs\":" + String(autoFadeDurationMs) + "}";
+  server.send(200, "application/json; charset=utf-8", json);
 }
 
 void handleLevels() {
@@ -2111,6 +2275,53 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       </div>
 
       <div class="panel" style="margin:0 0 12px; padding:12px;">
+        <div class="panel-title" style="margin-bottom: 10px;"><span class="icon">⏱</span><span>AUTO周期設定</span></div>
+        <div class="levels-wrap">
+          <div class="level-row" style="grid-template-columns: 1fr 1fr; gap: 10px;">
+            <label class="label" for="auto-start-h">開始時</label>
+            <input id="auto-start-h" type="number" min="0" max="23" value="8" style="width: 100%; border-radius: 10px; border: 1px solid var(--border); background: rgba(15,23,32,0.9); color: var(--text); padding: 8px 10px; font-weight:700; text-align:center;">
+          </div>
+          <div class="level-row" style="grid-template-columns: 1fr 1fr; gap: 10px;">
+            <label class="label" for="auto-end-h">終了時</label>
+            <input id="auto-end-h" type="number" min="0" max="23" value="17" style="width: 100%; border-radius: 10px; border: 1px solid var(--border); background: rgba(15,23,32,0.9); color: var(--text); padding: 8px 10px; font-weight:700; text-align:center;">
+          </div>
+          <div class="level-row" style="grid-template-columns: 1fr 1fr; gap: 10px;">
+            <label class="label" for="auto-fan-min">ファン開始分</label>
+            <input id="auto-fan-min" type="number" min="0" max="59" value="52" style="width: 100%; border-radius: 10px; border: 1px solid var(--border); background: rgba(15,23,32,0.9); color: var(--text); padding: 8px 10px; font-weight:700; text-align:center;">
+          </div>
+          <div class="level-row" style="grid-template-columns: 1fr 1fr; gap: 10px;">
+            <label class="label" for="auto-fan-ms">ファン時間(秒)</label>
+            <input id="auto-fan-ms" type="number" min="100" max="60000" step="100" value="2000" style="width: 100%; border-radius: 10px; border: 1px solid var(--border); background: rgba(15,23,32,0.9); color: var(--text); padding: 8px 10px; font-weight:700; text-align:center;">
+          </div>
+          <div class="level-row" style="grid-template-columns: 1fr 1fr; gap: 10px;">
+            <label class="label" for="auto-fan-pct">AUTOファン出力</label>
+            <input id="auto-fan-pct" type="number" min="0" max="100" value="10" style="width: 100%; border-radius: 10px; border: 1px solid var(--border); background: rgba(15,23,32,0.9); color: var(--text); padding: 8px 10px; font-weight:700; text-align:center;">
+          </div>
+          <div class="level-row" style="grid-template-columns: 1fr 1fr; gap: 10px;">
+            <label class="label" for="auto-l1-min">LIGHT 1</label>
+            <input id="auto-l1-min" type="number" min="0" max="59" value="53" style="width: 100%; border-radius: 10px; border: 1px solid var(--border); background: rgba(15,23,32,0.9); color: var(--text); padding: 8px 10px; font-weight:700; text-align:center;">
+          </div>
+          <div class="level-row" style="grid-template-columns: 1fr 1fr; gap: 10px;">
+            <label class="label" for="auto-l2-min">LIGHT 2</label>
+            <input id="auto-l2-min" type="number" min="0" max="59" value="54" style="width: 100%; border-radius: 10px; border: 1px solid var(--border); background: rgba(15,23,32,0.9); color: var(--text); padding: 8px 10px; font-weight:700; text-align:center;">
+          </div>
+          <div class="level-row" style="grid-template-columns: 1fr 1fr; gap: 10px;">
+            <label class="label" for="auto-l3-min">LIGHT 3</label>
+            <input id="auto-l3-min" type="number" min="0" max="59" value="55" style="width: 100%; border-radius: 10px; border: 1px solid var(--border); background: rgba(15,23,32,0.9); color: var(--text); padding: 8px 10px; font-weight:700; text-align:center;">
+          </div>
+          <div class="level-row" style="grid-template-columns: 1fr 1fr; gap: 10px;">
+            <label class="label" for="auto-fade-min">フェード開始分</label>
+            <input id="auto-fade-min" type="number" min="0" max="59" value="59" style="width: 100%; border-radius: 10px; border: 1px solid var(--border); background: rgba(15,23,32,0.9); color: var(--text); padding: 8px 10px; font-weight:700; text-align:center;">
+          </div>
+          <div class="level-row" style="grid-template-columns: 1fr 1fr; gap: 10px;">
+            <label class="label" for="auto-fade-ms">フェード時間(秒)</label>
+            <input id="auto-fade-ms" type="number" min="1000" max="60000" step="1000" value="60000" style="width: 100%; border-radius: 10px; border: 1px solid var(--border); background: rgba(15,23,32,0.9); color: var(--text); padding: 8px 10px; font-weight:700; text-align:center;">
+          </div>
+          <button id="auto-save-btn" class="segmented" type="button" style="margin-top: 8px;">AUTO設定を保存</button>
+        </div>
+      </div>
+
+      <div class="panel" style="margin:0 0 12px; padding:12px;">
         <div class="panel-title" style="margin-bottom: 10px;"><span class="icon">☼</span><span>Weather</span></div>
         <div class="weather-grid">
           <button class="segmented weather active" data-weather="0" id="weather-sunny">Sunny</button>
@@ -2348,6 +2559,28 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       return `${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
     }
 
+    function updateAutoConfigForm(data) {
+      const configMap = {
+        'auto-start-h': data.autoStartHour ?? 8,
+        'auto-end-h': data.autoEndHour ?? 17,
+        'auto-fan-min': data.autoFanStartMinute ?? 52,
+        'auto-fan-ms': data.autoFanDurationMs ?? 2000,
+        'auto-fan-pct': data.autoFanSpeed ?? 10,
+        'auto-l1-min': data.autoL1Min ?? 53,
+        'auto-l2-min': data.autoL2Min ?? 54,
+        'auto-l3-min': data.autoL3Min ?? 55,
+        'auto-fade-min': data.autoFadeStartMinute ?? 59,
+        'auto-fade-ms': data.autoFadeDurationMs ?? 60000
+      };
+
+      Object.entries(configMap).forEach(([id, value]) => {
+        const input = document.getElementById(id);
+        if (input && document.activeElement !== input) {
+          input.value = value;
+        }
+      });
+    }
+
     function updateStatus() {
       fetch('/status')
         .then((response) => response.json())
@@ -2366,6 +2599,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
           document.getElementById('mode-manual').classList.toggle('active', modeValue === 1);
           applyFixtureSelectionState();
           applyWeatherState();
+          updateAutoConfigForm(data);
 
           const fanValue = Number(data.fan ?? 0);
           const fanSlider = document.getElementById('fan-slider');
@@ -2440,6 +2674,35 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       fanDebounceTimer = setTimeout(() => {
         fetch('/fan?speed=' + safe).then(updateStatus);
       }, 80);
+    }
+
+    function saveAutoSettings() {
+      const params = new URLSearchParams({
+        startHour: document.getElementById('auto-start-h').value,
+        endHour: document.getElementById('auto-end-h').value,
+        fanStartMinute: document.getElementById('auto-fan-min').value,
+        fanDurationMs: document.getElementById('auto-fan-ms').value,
+        fanSpeed: document.getElementById('auto-fan-pct').value,
+        light1Min: document.getElementById('auto-l1-min').value,
+        light2Min: document.getElementById('auto-l2-min').value,
+        light3Min: document.getElementById('auto-l3-min').value,
+        fadeStartMinute: document.getElementById('auto-fade-min').value,
+        fadeDurationMs: document.getElementById('auto-fade-ms').value
+      });
+
+      fetch('/auto/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8' },
+        body: params.toString()
+      })
+        .then(async (response) => {
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) {
+            alert(data.error || 'AUTO設定の保存に失敗しました');
+            return;
+          }
+          updateStatus();
+        });
     }
 
     function sendDosingStart() {
@@ -2589,6 +2852,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
     document.getElementById('dosing-start-btn')?.addEventListener('click', sendDosingStart);
     document.getElementById('dosing-stop-btn')?.addEventListener('click', sendDosingStop);
+    document.getElementById('auto-save-btn')?.addEventListener('click', saveAutoSettings);
 
     document.querySelectorAll('.preset-btn').forEach((button) => {
       button.addEventListener('click', () => {
@@ -2640,6 +2904,7 @@ void setupWebServer() {
   server.on("/status", handleStatus);
   server.on("/mode", handleMode);
   server.on("/weather", handleWeather);
+  server.on("/auto/settings", handleAutoSettings);
   server.on("/fixture", handleFixtureSelection);
   server.on("/levels", handleLevels);
   server.on("/fan", handleFan);
