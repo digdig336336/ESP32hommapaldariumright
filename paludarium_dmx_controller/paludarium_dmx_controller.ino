@@ -439,7 +439,8 @@ bool isAutoSettingsValid() {
   const int light2Start = autoLightStartMinutes[1] * 60 + autoLightStartSeconds[1];
   const int light3Start = autoLightStartMinutes[2] * 60 + autoLightStartSeconds[2];
   const int fadeStart = autoFadeStartMinute * 60 + autoFadeStartSecond;
-  const int fadeDurationSec = max(1, (autoFadeDurationMs + 999UL) / 1000UL);
+  const uint32_t fadeDurationSec =
+      std::max<uint32_t>(1U, (autoFadeDurationMs + 999U) / 1000U);
 
   if (!(light1Start < light2Start && light2Start < light3Start && light3Start < fadeStart)) {
     return false;
@@ -1373,7 +1374,8 @@ void handleAutoSettings() {
   const int light2Start = light2Min * 60 + light2Sec;
   const int light3Start = light3Min * 60 + light3Sec;
   const int fadeStart = fadeStartMinute * 60 + fadeStartSecond;
-  const int fadeDurationSec = max(1, (fadeDurationMs + 999UL) / 1000UL);
+  const uint32_t fadeDurationSec =
+      std::max<uint32_t>(1U, (fadeDurationMs + 999U) / 1000U);
 
   if (startHour >= endHour) {
     server.send(400, "application/json; charset=utf-8", "{\"ok\":false,\"error\":\"運転開始時刻は終了時刻より前である必要があります\"}");
