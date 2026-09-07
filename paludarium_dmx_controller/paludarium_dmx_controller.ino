@@ -81,6 +81,102 @@ uint8_t blue = 0;
 uint8_t white = 0;
 uint8_t masterDimmer = 255;
 
+struct FixtureState {
+  uint8_t red;
+  uint8_t green;
+  uint8_t blue;
+  uint8_t white;
+  uint8_t master;
+};
+
+constexpr size_t FIXTURE_COUNT = 3;
+constexpr uint16_t FIXTURE_DMX_ADDRESSES[FIXTURE_COUNT] = { 1, 6, 11 };
+FixtureState fixtures[FIXTURE_COUNT] = {
+  {255, 0, 0, 0, 255},
+  {255, 0, 0, 0, 255},
+  {255, 0, 0, 0, 255}
+};
+FixtureState manualFixtures[FIXTURE_COUNT] = {
+  {255, 0, 0, 0, 255},
+  {255, 0, 0, 0, 255},
+  {255, 0, 0, 0, 255}
+};
+int selectedFixture = 0;  // 0: ALL, 1..3: LIGHT 1..3
+
+uint8_t clampDmxValue(int value) {
+  return static_cast<uint8_t>(constrain(value, 0, 255));
+}
+
+void updateSelectedFixtureState() {
+  if (selectedFixture < 0 || selectedFixture > FIXTURE_COUNT) {
+    selectedFixture = 0;
+  }
+
+  if (selectedFixture == 0) {
+    const FixtureState& fixture = fixtures[0];
+    red = fixture.red;
+    green = fixture.green;
+    blue = fixture.blue;
+    white = fixture.white;
+    masterDimmer = fixture.master;
+    return;
+  }
+
+  const size_t fixtureIndex = static_cast<size_t>(selectedFixture - 1);
+  if (fixtureIndex < FIXTURE_COUNT) {
+    const FixtureState& fixture = fixtures[fixtureIndex];
+    red = fixture.red;
+    green = fixture.green;
+    blue = fixture.blue;
+    white = fixture.white;
+    masterDimmer = fixture.master;
+  }
+}
+
+void applyFixtureValues(size_t fixtureIndex, uint8_t r, uint8_t g, uint8_t b, uint8_t w, uint8_t d) {
+  if (fixtureIndex >= FIXTURE_COUNT) {
+    return;
+  }
+
+  fixtures[fixtureIndex].red = r;
+  fixtures[fixtureIndex].green = g;
+  fixtures[fixtureIndex].blue = b;
+  fixtures[fixtureIndex].white = w;
+  fixtures[fixtureIndex].master = d;
+}
+
+void applyRequestedChannelsToFixture(FixtureState& target, bool hasR, uint8_t r, bool hasG, uint8_t g, bool hasB, uint8_t b, bool hasW, uint8_t w, bool hasD, uint8_t d) {
+  if (hasR) target.red = r;
+  if (hasG) target.green = g;
+  if (hasB) target.blue = b;
+  if (hasW) target.white = w;
+  if (hasD) target.master = d;
+}
+
+void applyValuesToFixtureSelection(int fixtureSelection, bool hasR, uint8_t r, bool hasG, uint8_t g, bool hasB, uint8_t b, bool hasW, uint8_t w, bool hasD, uint8_t d) {
+  if (fixtureSelection == 0) {
+    for (size_t i = 0; i < FIXTURE_COUNT; ++i) {
+      applyRequestedChannelsToFixture(fixtures[i], hasR, r, hasG, g, hasB, b, hasW, w, hasD, d);
+      applyRequestedChannelsToFixture(manualFixtures[i], hasR, r, hasG, g, hasB, b, hasW, w, hasD, d);
+    }
+    return;
+  }
+
+  if (fixtureSelection >= 1 && fixtureSelection <= static_cast<int>(FIXTURE_COUNT)) {
+    const size_t fixtureIndex = static_cast<size_t>(fixtureSelection - 1);
+    applyRequestedChannelsToFixture(fixtures[fixtureIndex], hasR, r, hasG, g, hasB, b, hasW, w, hasD, d);
+    applyRequestedChannelsToFixture(manualFixtures[fixtureIndex], hasR, r, hasG, g, hasB, b, hasW, w, hasD, d);
+  }
+}
+
+void restoreManualFixturesToLive() {
+  for (size_t i = 0; i < FIXTURE_COUNT; ++i) {
+    fixtures[i] = manualFixtures[i];
+  }
+  updateSelectedFixtureState();
+  updateDMXBuffer();
+}
+
 // mode: 0=AUTO, 1=MANUAL
 int mode = 1;
 
@@ -146,6 +242,10 @@ uint32_t lastDmxMs = 0;
 uint32_t lastTimeMs = 0;
 uint32_t lastLightMs = 0;
 uint32_t pendingWifiReconnectMs = 0;
+<<<<<<< HEAD
+=======
+uint32_t wifiConnectStartedMs = 0;
+>>>>>>> 6937912 (20260907)
 String pendingWifiReconnectSsid = "";
 String pendingWifiReconnectPassword = "";
 DNSServer dnsServer;
@@ -204,16 +304,24 @@ String jsonEscape(const String& input);
 // -----------------------------------------------------------------------------
 
 void updateDMXBuffer() {
-  dmxData[0] = 0x00;          // DMX NULL Start Code
-  dmxData[1] = red;           // CH1 Red
-  dmxData[2] = green;         // CH2 Green
-  dmxData[3] = blue;          // CH3 Blue
-  dmxData[4] = white;         // CH4 White
-  dmxData[5] = masterDimmer;  // CH5 Master Dimmer
-
-  // CH6～CH512は0のままにする。
-  for (size_t i = 6; i < DMX_PACKET_BYTES; ++i) {
+  for (size_t i = 0; i < DMX_PACKET_BYTES; ++i) {
     dmxData[i] = 0;
+  }
+  dmxData[0] = 0x00;  // DMX NULL Start Code
+
+  for (size_t fixtureIndex = 0; fixtureIndex < FIXTURE_COUNT; ++fixtureIndex) {
+    const FixtureState& fixture = fixtures[fixtureIndex];
+    const size_t baseChannel = FIXTURE_DMX_ADDRESSES[fixtureIndex];
+
+    if (baseChannel + 4 >= DMX_PACKET_BYTES) {
+      continue;
+    }
+
+    dmxData[baseChannel] = fixture.red;
+    dmxData[baseChannel + 1] = fixture.green;
+    dmxData[baseChannel + 2] = fixture.blue;
+    dmxData[baseChannel + 3] = fixture.white;
+    dmxData[baseChannel + 4] = fixture.master;
   }
 }
 
@@ -415,12 +523,15 @@ void updateAutomaticLight() {
     baseMaster = scale8(baseMaster, 0.80f);
   }
 
-  red = baseR;
-  green = baseG;
-  blue = baseB;
-  white = baseW;
-  masterDimmer = baseMaster;
+  for (size_t i = 0; i < FIXTURE_COUNT; ++i) {
+    fixtures[i].red = baseR;
+    fixtures[i].green = baseG;
+    fixtures[i].blue = baseB;
+    fixtures[i].white = baseW;
+    fixtures[i].master = baseMaster;
+  }
 
+  updateSelectedFixtureState();
   updateDMXBuffer();
 }
 
@@ -435,21 +546,49 @@ void loadSettings() {
   const bool hasSavedValues = preferences.isKey("mode") || preferences.isKey("weather") ||
                               preferences.isKey("manual_r") || preferences.isKey("manual_g") ||
                               preferences.isKey("manual_b") || preferences.isKey("manual_w") ||
-                              preferences.isKey("manual_d") || preferences.isKey("fan_speed") ||
-                              preferences.isKey("dosing_ms");
+                              preferences.isKey("manual_d") || preferences.isKey("f1_r") ||
+                              preferences.isKey("f1_g") || preferences.isKey("f1_b") ||
+                              preferences.isKey("f1_w") || preferences.isKey("f1_d") ||
+                              preferences.isKey("fan_speed") || preferences.isKey("dosing_ms");
 
   if (hasSavedValues) {
     mode = preferences.getUChar("mode", mode);
     weather = preferences.getUChar("weather", weather);
-    red = preferences.getUChar("manual_r", red);
-    green = preferences.getUChar("manual_g", green);
-    blue = preferences.getUChar("manual_b", blue);
-    white = preferences.getUChar("manual_w", white);
-    masterDimmer = preferences.getUChar("manual_d", masterDimmer);
+
+    for (size_t i = 0; i < FIXTURE_COUNT; ++i) {
+      const String fixturePrefix = "f" + String(i + 1);
+      const String redKey = fixturePrefix + "_r";
+      const String greenKey = fixturePrefix + "_g";
+      const String blueKey = fixturePrefix + "_b";
+      const String whiteKey = fixturePrefix + "_w";
+      const String dimKey = fixturePrefix + "_d";
+
+      manualFixtures[i].red = preferences.getUChar(redKey.c_str(), manualFixtures[i].red);
+      manualFixtures[i].green = preferences.getUChar(greenKey.c_str(), manualFixtures[i].green);
+      manualFixtures[i].blue = preferences.getUChar(blueKey.c_str(), manualFixtures[i].blue);
+      manualFixtures[i].white = preferences.getUChar(whiteKey.c_str(), manualFixtures[i].white);
+      manualFixtures[i].master = preferences.getUChar(dimKey.c_str(), manualFixtures[i].master);
+    }
+
+    if (!preferences.isKey("f1_r") && preferences.isKey("manual_r")) {
+      manualFixtures[0].red = preferences.getUChar("manual_r", manualFixtures[0].red);
+      manualFixtures[0].green = preferences.getUChar("manual_g", manualFixtures[0].green);
+      manualFixtures[0].blue = preferences.getUChar("manual_b", manualFixtures[0].blue);
+      manualFixtures[0].white = preferences.getUChar("manual_w", manualFixtures[0].white);
+      manualFixtures[0].master = preferences.getUChar("manual_d", manualFixtures[0].master);
+      for (size_t i = 1; i < FIXTURE_COUNT; ++i) {
+        manualFixtures[i] = manualFixtures[0];
+      }
+    }
+
     fanSpeed = preferences.getUChar("fan_speed", fanSpeed);
     dosingDurationMs = preferences.getULong("dosing_ms", dosingDurationMs);
   }
 
+  for (size_t i = 0; i < FIXTURE_COUNT; ++i) {
+    fixtures[i] = manualFixtures[i];
+  }
+  updateSelectedFixtureState();
   preferences.end();
 }
 
@@ -465,11 +604,21 @@ void saveSettings() {
   preferences.begin("paludarium", false);
   preferences.putUChar("mode", static_cast<uint8_t>(mode));
   preferences.putUChar("weather", static_cast<uint8_t>(weather));
-  preferences.putUChar("manual_r", red);
-  preferences.putUChar("manual_g", green);
-  preferences.putUChar("manual_b", blue);
-  preferences.putUChar("manual_w", white);
-  preferences.putUChar("manual_d", masterDimmer);
+
+  for (size_t i = 0; i < FIXTURE_COUNT; ++i) {
+    const String fixturePrefix = "f" + String(i + 1);
+    preferences.putUChar((fixturePrefix + "_r").c_str(), manualFixtures[i].red);
+    preferences.putUChar((fixturePrefix + "_g").c_str(), manualFixtures[i].green);
+    preferences.putUChar((fixturePrefix + "_b").c_str(), manualFixtures[i].blue);
+    preferences.putUChar((fixturePrefix + "_w").c_str(), manualFixtures[i].white);
+    preferences.putUChar((fixturePrefix + "_d").c_str(), manualFixtures[i].master);
+  }
+
+  preferences.putUChar("manual_r", manualFixtures[0].red);
+  preferences.putUChar("manual_g", manualFixtures[0].green);
+  preferences.putUChar("manual_b", manualFixtures[0].blue);
+  preferences.putUChar("manual_w", manualFixtures[0].white);
+  preferences.putUChar("manual_d", manualFixtures[0].master);
   preferences.putUChar("fan_speed", fanSpeed);
   preferences.putULong("dosing_ms", dosingDurationMs);
   preferences.end();
@@ -700,6 +849,13 @@ bool trySavedNetworks() {
     return false;
   }
 
+<<<<<<< HEAD
+=======
+  if (wifiState == WIFI_STATE_CONNECTING) {
+    return false;
+  }
+
+>>>>>>> 6937912 (20260907)
   WiFi.mode(WIFI_AP_STA);
   WiFi.disconnect(false);
 
@@ -710,6 +866,10 @@ bool trySavedNetworks() {
   const uint8_t currentIndex = savedNetworkAttemptIndex;
   wifiConnectSsid = savedNetworks[currentIndex].ssid;
   wifiConnectPass = savedNetworks[currentIndex].password;
+<<<<<<< HEAD
+=======
+  wifiConnectStartedMs = millis();
+>>>>>>> 6937912 (20260907)
   WiFi.begin(wifiConnectSsid.c_str(), wifiConnectPass.c_str());
   wifiState = WIFI_STATE_CONNECTING;
   wifiStateChangedMs = millis();
@@ -796,7 +956,9 @@ void startMDNS() {
 
 void handleStatus() {
   String json;
-  json.reserve(256);
+  json.reserve(512);
+
+  updateSelectedFixtureState();
 
   wifiConnected = WiFi.status() == WL_CONNECTED;
   if (wifiConnected) {
@@ -819,6 +981,15 @@ void handleStatus() {
   json += "\"b\":" + String(blue) + ",";
   json += "\"w\":" + String(white) + ",";
   json += "\"d\":" + String(masterDimmer) + ",";
+  json += "\"selectedFixture\":" + String(selectedFixture) + ",";
+  json += "\"fixtures\":[";
+  for (size_t i = 0; i < FIXTURE_COUNT; ++i) {
+    if (i > 0) {
+      json += ",";
+    }
+    json += "{\"r\":" + String(fixtures[i].red) + ",\"g\":" + String(fixtures[i].green) + ",\"b\":" + String(fixtures[i].blue) + ",\"w\":" + String(fixtures[i].white) + ",\"d\":" + String(fixtures[i].master) + "}";
+  }
+  json += "],";
   json += "\"fan\":" + String(fanSpeed) + ",";
   json += "\"mode\":" + String(mode) + ",";
   json += "\"weather\":" + String(weather) + ",";
@@ -912,9 +1083,20 @@ void attemptWifiConnection(const String& ssid, const String& password) {
     return;
   }
 
+<<<<<<< HEAD
   WiFi.mode(WIFI_AP_STA);
   WiFi.hostname(hostname.c_str());
   WiFi.disconnect(false);
+=======
+  if (wifiState == WIFI_STATE_CONNECTING) {
+    return;
+  }
+
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.hostname(hostname.c_str());
+  WiFi.disconnect(false);
+  wifiConnectStartedMs = millis();
+>>>>>>> 6937912 (20260907)
   WiFi.begin(ssid.c_str(), password.c_str());
   wifiConnectSsid = ssid;
   wifiConnectPass = password;
@@ -1026,6 +1208,7 @@ void handleMode() {
   if (mode == 0) {
     updateAutomaticLight();
   } else {
+    restoreManualFixturesToLive();
     phase = "手動";
   }
 
@@ -1045,17 +1228,53 @@ void handleWeather() {
 }
 
 void handleLevels() {
-  if (server.hasArg("r")) red = constrain(server.arg("r").toInt(), 0, 255);
-  if (server.hasArg("g")) green = constrain(server.arg("g").toInt(), 0, 255);
-  if (server.hasArg("b")) blue = constrain(server.arg("b").toInt(), 0, 255);
-  if (server.hasArg("w")) white = constrain(server.arg("w").toInt(), 0, 255);
-  if (server.hasArg("d")) masterDimmer = constrain(server.arg("d").toInt(), 0, 255);
+  int fixtureSelection = selectedFixture;
+  if (server.hasArg("fixture")) {
+    fixtureSelection = server.arg("fixture").toInt();
+    if (fixtureSelection < 0 || fixtureSelection > FIXTURE_COUNT) {
+      server.send(400, "text/plain; charset=utf-8", "Invalid fixture selection");
+      return;
+    }
+    selectedFixture = fixtureSelection;
+  }
+
+  const bool hasR = server.hasArg("r");
+  const bool hasG = server.hasArg("g");
+  const bool hasB = server.hasArg("b");
+  const bool hasW = server.hasArg("w");
+  const bool hasD = server.hasArg("d");
+
+  const uint8_t nextR = hasR ? clampDmxValue(server.arg("r").toInt()) : 0;
+  const uint8_t nextG = hasG ? clampDmxValue(server.arg("g").toInt()) : 0;
+  const uint8_t nextB = hasB ? clampDmxValue(server.arg("b").toInt()) : 0;
+  const uint8_t nextW = hasW ? clampDmxValue(server.arg("w").toInt()) : 0;
+  const uint8_t nextD = hasD ? clampDmxValue(server.arg("d").toInt()) : 0;
+
+  applyValuesToFixtureSelection(fixtureSelection, hasR, nextR, hasG, nextG, hasB, nextB, hasW, nextW, hasD, nextD);
+  updateSelectedFixtureState();
 
   mode = 1;
   phase = "手動";
   markSettingsDirty();
   updateDMXBuffer();
 
+  server.send(200, "text/plain; charset=utf-8", "OK");
+}
+
+void handleFixtureSelection() {
+  if (!server.hasArg("fixture")) {
+    server.send(400, "text/plain; charset=utf-8", "Invalid fixture selection");
+    return;
+  }
+
+  const int fixtureSelection = server.arg("fixture").toInt();
+  if (fixtureSelection < 0 || fixtureSelection > FIXTURE_COUNT) {
+    server.send(400, "text/plain; charset=utf-8", "Invalid fixture selection");
+    return;
+  }
+
+  selectedFixture = fixtureSelection;
+  updateSelectedFixtureState();
   server.send(200, "text/plain; charset=utf-8", "OK");
 }
 
@@ -1915,6 +2134,16 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <div class="panel-title"><span class="icon">☀</span><span>LIGHT</span></div>
 
       <div class="panel" style="margin:0 0 12px; padding:12px;">
+        <div class="panel-title" style="margin-bottom: 10px;"><span class="icon">✦</span><span>Fixture</span></div>
+        <div class="mode-grid">
+          <button class="segmented active" data-fixture="0" id="fixture-all">ALL</button>
+          <button class="segmented" data-fixture="1" id="fixture-1">LIGHT 1</button>
+          <button class="segmented" data-fixture="2" id="fixture-2">LIGHT 2</button>
+          <button class="segmented" data-fixture="3" id="fixture-3">LIGHT 3</button>
+        </div>
+      </div>
+
+      <div class="panel" style="margin:0 0 12px; padding:12px;">
         <div class="panel-title" style="margin-bottom: 10px;"><span class="icon">✦</span><span>Mode</span></div>
         <div class="mode-grid">
           <button class="segmented" data-mode="0" id="mode-auto">AUTO</button>
@@ -2092,6 +2321,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     let holdTimer = null;
     let holdDelta = 0;
     let holdChannel = null;
+    window.currentFixture = 0;
 
     function clampChannel(value) {
       return Math.min(255, Math.max(0, value));
@@ -2135,6 +2365,22 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       });
     }
 
+    function applyFixtureSelectionState() {
+      const fixtureButtons = document.querySelectorAll('[data-fixture]');
+      fixtureButtons.forEach((btn) => {
+        const isActive = Number(btn.dataset.fixture) === Number(window.currentFixture ?? 0);
+        btn.classList.toggle('active', isActive);
+      });
+    }
+
+    function setFixtureSelection(value) {
+      const safe = Math.max(0, Math.min(3, Number(value) || 0));
+      window.currentFixture = safe;
+      applyFixtureSelectionState();
+      fetch('/fixture?fixture=' + safe)
+        .then(() => updateStatus());
+    }
+
     function formatRemaining(ms) {
       const safe = Math.max(0, Number(ms) || 0);
       const totalSeconds = Math.ceil(safe / 1000);
@@ -2155,9 +2401,11 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
           document.getElementById('wifi-pill').textContent = data.wifi || '未接続';
           document.getElementById('device-label').textContent = data.deviceId || 'Paludarium Light';
           window.currentWeather = Number(data.weather ?? 0);
+          window.currentFixture = Number(data.selectedFixture ?? 0);
           const modeValue = Number(data.mode ?? 1);
           document.getElementById('mode-auto').classList.toggle('active', modeValue === 0);
           document.getElementById('mode-manual').classList.toggle('active', modeValue === 1);
+          applyFixtureSelectionState();
           applyWeatherState();
 
           const fanValue = Number(data.fan ?? 0);
@@ -2254,7 +2502,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
       clearTimeout(levelDebounceTimer);
       levelDebounceTimer = setTimeout(() => {
-        fetch('/levels?' + params);
+        fetch('/levels?fixture=' + (window.currentFixture ?? 0) + '&' + params);
       }, 80);
     }
 
@@ -2350,6 +2598,9 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       if (button.dataset.weather !== undefined) {
         button.addEventListener('click', () => setWeather(Number(button.dataset.weather)));
       }
+      if (button.dataset.fixture !== undefined) {
+        button.addEventListener('click', () => setFixtureSelection(Number(button.dataset.fixture)));
+      }
     });
 
     document.getElementById('fan-slider')?.addEventListener('input', (event) => {
@@ -2430,6 +2681,7 @@ void setupWebServer() {
   server.on("/status", handleStatus);
   server.on("/mode", handleMode);
   server.on("/weather", handleWeather);
+  server.on("/fixture", handleFixtureSelection);
   server.on("/levels", handleLevels);
   server.on("/fan", handleFan);
   server.on("/dosing/start", handleDosingStart);
@@ -2564,6 +2816,7 @@ void maintainWiFi() {
   const wl_status_t currentStatus = WiFi.status();
 
   if (currentStatus == WL_CONNECTED) {
+    wifiConnectStartedMs = 0;
     if (wifiState != WIFI_STATE_CONNECTED) {
       wifiState = WIFI_STATE_CONNECTED;
       wifiStateChangedMs = millis();
@@ -2640,11 +2893,25 @@ void maintainWiFi() {
     }
 
     case WIFI_STATE_CONNECTING:
+<<<<<<< HEAD
       if ((millis() - wifiStateChangedMs) >= WIFI_SAVED_NETWORK_TIMEOUT_MS) {
         WiFi.disconnect(false);
         savedNetworkAttemptIndex += 1;
         if (savedNetworkAttemptIndex < savedNetworkCount) {
           trySavedNetworks();
+=======
+      if (wifiConnectStartedMs == 0) {
+        wifiConnectStartedMs = wifiStateChangedMs;
+      }
+
+      if ((millis() - wifiConnectStartedMs) >= WIFI_SAVED_NETWORK_TIMEOUT_MS) {
+        WiFi.disconnect(false);
+        savedNetworkAttemptIndex += 1;
+        if (savedNetworkAttemptIndex < savedNetworkCount) {
+          if (savedNetworkCount > 0) {
+            trySavedNetworks();
+          }
+>>>>>>> 6937912 (20260907)
           Serial.print("[W] retry saved network index: ");
           Serial.println(savedNetworkAttemptIndex);
           Serial.flush();
