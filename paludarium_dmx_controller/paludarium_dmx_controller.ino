@@ -420,7 +420,7 @@ bool isAutoCycleWindowActive(const struct tm& timeinfo) {
 }
 
 void setAutoFanOutput(bool active) {
-  const uint8_t targetSpeed = active ? 20 : 0;
+  const uint8_t targetSpeed = active ? 10 : 0;
   fanSpeed = targetSpeed;
   ledcWrite(FAN_PIN, active ? map(targetSpeed, 0, 100, 0, 255) : 0);
 }
