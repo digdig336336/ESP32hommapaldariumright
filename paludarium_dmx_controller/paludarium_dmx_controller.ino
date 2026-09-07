@@ -242,10 +242,7 @@ uint32_t lastDmxMs = 0;
 uint32_t lastTimeMs = 0;
 uint32_t lastLightMs = 0;
 uint32_t pendingWifiReconnectMs = 0;
-<<<<<<< HEAD
-=======
 uint32_t wifiConnectStartedMs = 0;
->>>>>>> 6937912 (20260907)
 String pendingWifiReconnectSsid = "";
 String pendingWifiReconnectPassword = "";
 DNSServer dnsServer;
@@ -849,13 +846,10 @@ bool trySavedNetworks() {
     return false;
   }
 
-<<<<<<< HEAD
-=======
   if (wifiState == WIFI_STATE_CONNECTING) {
     return false;
   }
 
->>>>>>> 6937912 (20260907)
   WiFi.mode(WIFI_AP_STA);
   WiFi.disconnect(false);
 
@@ -866,10 +860,7 @@ bool trySavedNetworks() {
   const uint8_t currentIndex = savedNetworkAttemptIndex;
   wifiConnectSsid = savedNetworks[currentIndex].ssid;
   wifiConnectPass = savedNetworks[currentIndex].password;
-<<<<<<< HEAD
-=======
   wifiConnectStartedMs = millis();
->>>>>>> 6937912 (20260907)
   WiFi.begin(wifiConnectSsid.c_str(), wifiConnectPass.c_str());
   wifiState = WIFI_STATE_CONNECTING;
   wifiStateChangedMs = millis();
@@ -1083,11 +1074,6 @@ void attemptWifiConnection(const String& ssid, const String& password) {
     return;
   }
 
-<<<<<<< HEAD
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.hostname(hostname.c_str());
-  WiFi.disconnect(false);
-=======
   if (wifiState == WIFI_STATE_CONNECTING) {
     return;
   }
@@ -1096,7 +1082,6 @@ void attemptWifiConnection(const String& ssid, const String& password) {
   WiFi.hostname(hostname.c_str());
   WiFi.disconnect(false);
   wifiConnectStartedMs = millis();
->>>>>>> 6937912 (20260907)
   WiFi.begin(ssid.c_str(), password.c_str());
   wifiConnectSsid = ssid;
   wifiConnectPass = password;
@@ -2806,7 +2791,14 @@ void maintainWiFi() {
 
   if (pendingWifiReconnectMs != 0 && millis() >= pendingWifiReconnectMs) {
     if (pendingWifiReconnectSsid.length() > 0) {
-      attemptWifiConnection(pendingWifiReconnectSsid, pendingWifiReconnectPassword);
+      // 保存後の予約接続なので、接続中判定を解除してから開始する
+      wifiState = WIFI_STATE_IDLE;
+      wifiConnectStartedMs = 0;
+
+      attemptWifiConnection(
+        pendingWifiReconnectSsid,
+        pendingWifiReconnectPassword
+      );
     }
     pendingWifiReconnectMs = 0;
     pendingWifiReconnectSsid = "";
@@ -2893,13 +2885,6 @@ void maintainWiFi() {
     }
 
     case WIFI_STATE_CONNECTING:
-<<<<<<< HEAD
-      if ((millis() - wifiStateChangedMs) >= WIFI_SAVED_NETWORK_TIMEOUT_MS) {
-        WiFi.disconnect(false);
-        savedNetworkAttemptIndex += 1;
-        if (savedNetworkAttemptIndex < savedNetworkCount) {
-          trySavedNetworks();
-=======
       if (wifiConnectStartedMs == 0) {
         wifiConnectStartedMs = wifiStateChangedMs;
       }
@@ -2911,7 +2896,6 @@ void maintainWiFi() {
           if (savedNetworkCount > 0) {
             trySavedNetworks();
           }
->>>>>>> 6937912 (20260907)
           Serial.print("[W] retry saved network index: ");
           Serial.println(savedNetworkAttemptIndex);
           Serial.flush();
