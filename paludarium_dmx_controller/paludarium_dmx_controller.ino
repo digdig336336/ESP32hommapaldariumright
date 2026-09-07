@@ -365,78 +365,11 @@ void setupDMX() {
 // 時刻・自動照明
 // -----------------------------------------------------------------------------
 
-struct LightKeyframe {
-  int minute;
-  uint8_t r;
-  uint8_t g;
-  uint8_t b;
-  uint8_t w;
-  uint8_t master;
-};
-
-// AUTOモードの光量を簡単に調整できるよう、時刻ごとのキーフレームをまとめて管理する。
-// 各値は 00:00〜24:00 の一日内で線形補間される。
-const LightKeyframe AUTO_KEYFRAMES[] = {
-  { 0,   20,  20,  80,   0, 150 },
-  { 330, 20,  20,  80,   0, 150 },
-  { 360,  80,  90,  90,  25, 180 },
-  { 420, 200, 180, 160, 120, 220 },
-  { 600, 255, 255, 255, 255, 255 },
-  { 960, 255, 228, 190, 160, 255 },
-  { 1080, 255, 120,  80,  40, 255 },
-  { 1170, 180,  60,  20,  12, 180 },
-  { 1260,  40,  30,  80,   8, 180 },
-  { 1440, 20,  20,  80,   0, 150 },
-};
-constexpr size_t AUTO_KEYFRAME_COUNT = sizeof(AUTO_KEYFRAMES) / sizeof(AUTO_KEYFRAMES[0]);
-
 const uint32_t SETTINGS_SAVE_DELAY_MS = 2000;
 
 Preferences preferences;
 bool settingsDirty = false;
 uint32_t lastSettingsChangeMs = 0;
-
-uint8_t interpolate8(uint8_t from, uint8_t to, float t) {
-  if (t < 0.0f) t = 0.0f;
-  if (t > 1.0f) t = 1.0f;
-  return static_cast<uint8_t>(lroundf(from + (to - from) * t));
-}
-
-uint8_t scale8(uint8_t value, float factor) {
-  int result = static_cast<int>(lroundf(value * factor));
-  if (result < 0) result = 0;
-  if (result > 255) result = 255;
-  return static_cast<uint8_t>(result);
-}
-
-void getAutoLightFromKeyframes(int totalMinutes, uint8_t& outR, uint8_t& outG, uint8_t& outB, uint8_t& outW, uint8_t& outMaster) {
-  if (totalMinutes < 0) totalMinutes = 0;
-  if (totalMinutes >= 1440) totalMinutes = 1440;
-
-  for (size_t i = 0; i < AUTO_KEYFRAME_COUNT - 1; ++i) {
-    const LightKeyframe& from = AUTO_KEYFRAMES[i];
-    const LightKeyframe& to = AUTO_KEYFRAMES[i + 1];
-
-    if (totalMinutes >= from.minute && totalMinutes <= to.minute) {
-      const float span = static_cast<float>(to.minute - from.minute);
-      const float t = (span > 0.0f) ? (static_cast<float>(totalMinutes - from.minute) / span) : 0.0f;
-
-      outR = interpolate8(from.r, to.r, t);
-      outG = interpolate8(from.g, to.g, t);
-      outB = interpolate8(from.b, to.b, t);
-      outW = interpolate8(from.w, to.w, t);
-      outMaster = interpolate8(from.master, to.master, t);
-      return;
-    }
-  }
-
-  const LightKeyframe& last = AUTO_KEYFRAMES[AUTO_KEYFRAME_COUNT - 1];
-  outR = last.r;
-  outG = last.g;
-  outB = last.b;
-  outW = last.w;
-  outMaster = last.master;
-}
 
 bool readLocalTime(struct tm& timeinfo) {
   // NTP未同期時にloopを長時間止めない。
@@ -449,7 +382,9 @@ void updateTimeDisplay() {
   if (!readLocalTime(timeinfo)) {
     timeStr = "--:--";
     dateStr = "----/--/-- (-)";
-    if (mode == 0) phase = "時刻未同期";
+    if (mode == 0) {
+      phase = "時刻未同期";
+    }
     return;
   }
 
@@ -472,60 +407,100 @@ void updateTimeDisplay() {
 
   if (mode == 1) {
     phase = "手動";
-  } else if (timeinfo.tm_hour < 6) {
-    phase = "夜";
-  } else if (timeinfo.tm_hour == 6 && timeinfo.tm_min < 30) {
-    phase = "夜明け";
-  } else if (timeinfo.tm_hour < 18) {
-    phase = "昼";
-  } else if (timeinfo.tm_hour == 18 && timeinfo.tm_min < 30) {
-    phase = "夕焼け";
-  } else if (timeinfo.tm_hour < 21) {
-    phase = "夕方";
   } else {
-    phase = "夜";
+    phase = "AUTO";
   }
 }
 
+bool isAutoCycleWindowActive(const struct tm& timeinfo) {
+  const int secondsOfDay = (timeinfo.tm_hour * 3600) + (timeinfo.tm_min * 60) + timeinfo.tm_sec;
+  const int cycleStartSec = 8 * 3600;
+  const int cycleEndSec = (17 * 3600) - 1;
+  return secondsOfDay >= cycleStartSec && secondsOfDay <= cycleEndSec;
+}
+
+void setAutoFanOutput(bool active) {
+  const uint8_t targetSpeed = active ? 10 : 0;
+  fanSpeed = targetSpeed;
+  ledcWrite(FAN_PIN, active ? map(targetSpeed, 0, 100, 0, 255) : 0);
+}
+
 void updateAutomaticLight() {
-  if (mode == 1) return;
-
-  struct tm timeinfo;
-  if (!readLocalTime(timeinfo)) return;
-
-  const int currentMinute = timeinfo.tm_hour * 60 + timeinfo.tm_min;
-
-  uint8_t baseR = 0;
-  uint8_t baseG = 0;
-  uint8_t baseB = 0;
-  uint8_t baseW = 0;
-  uint8_t baseMaster = 255;
-
-  getAutoLightFromKeyframes(currentMinute, baseR, baseG, baseB, baseW, baseMaster);
-
-  if (weather == 1) {
-    // Cloudy：約50秒周期で明るさを 60～100% の範囲で緩やかに変化させる。
-    const float cloudFactor = sinf(millis() / 8000.0f) * 0.20f + 0.80f;
-    baseR = scale8(baseR, cloudFactor);
-    baseG = scale8(baseG, cloudFactor);
-    baseB = scale8(baseB, cloudFactor);
-    baseW = scale8(baseW, cloudFactor);
-    baseMaster = scale8(baseMaster, cloudFactor);
-  } else if (weather == 2) {
-    // Rain：キーフレーム値に対して暗くし、やや青寄りにする。
-    baseR = scale8(baseR, 0.55f);
-    baseG = scale8(baseG, 0.70f);
-    baseB = scale8(baseB, 0.92f);
-    baseW = scale8(baseW, 0.60f);
-    baseMaster = scale8(baseMaster, 0.80f);
+  if (mode != 0) {
+    return;
   }
 
+  struct tm timeinfo;
+  if (!readLocalTime(timeinfo)) {
+    for (size_t i = 0; i < FIXTURE_COUNT; ++i) {
+      fixtures[i].red = 0;
+      fixtures[i].green = 0;
+      fixtures[i].blue = 0;
+      fixtures[i].white = 0;
+      fixtures[i].master = 0;
+    }
+    setAutoFanOutput(false);
+    updateSelectedFixtureState();
+    updateDMXBuffer();
+    phase = "時刻未同期";
+    return;
+  }
+
+  const int minute = timeinfo.tm_min;
+  const int second = timeinfo.tm_sec;
+
+  if (!isAutoCycleWindowActive(timeinfo)) {
+    for (size_t i = 0; i < FIXTURE_COUNT; ++i) {
+      fixtures[i].red = 0;
+      fixtures[i].green = 0;
+      fixtures[i].blue = 0;
+      fixtures[i].white = 0;
+      fixtures[i].master = 0;
+    }
+    setAutoFanOutput(false);
+    updateSelectedFixtureState();
+    updateDMXBuffer();
+    return;
+  }
+
+  const bool fanActive = (minute == 52) && (second < 2);
+  setAutoFanOutput(fanActive);
+
+  const bool light1Enabled = (minute >= 53 && minute < 59);
+  const bool light2Enabled = (minute >= 54 && minute < 59);
+  const bool light3Enabled = (minute >= 55 && minute < 59);
+  const bool fadeOut = (minute == 59);
+
   for (size_t i = 0; i < FIXTURE_COUNT; ++i) {
-    fixtures[i].red = baseR;
-    fixtures[i].green = baseG;
-    fixtures[i].blue = baseB;
-    fixtures[i].white = baseW;
-    fixtures[i].master = baseMaster;
+    bool fixtureEnabled = false;
+    if (i == 0 && light1Enabled) fixtureEnabled = true;
+    if (i == 1 && light2Enabled) fixtureEnabled = true;
+    if (i == 2 && light3Enabled) fixtureEnabled = true;
+    if (fadeOut) fixtureEnabled = true;
+
+    if (!fixtureEnabled) {
+      fixtures[i].red = 0;
+      fixtures[i].green = 0;
+      fixtures[i].blue = 0;
+      fixtures[i].white = 0;
+      fixtures[i].master = 0;
+      continue;
+    }
+
+    const FixtureState& source = manualFixtures[i];
+    fixtures[i].red = source.red;
+    fixtures[i].green = source.green;
+    fixtures[i].blue = source.blue;
+    fixtures[i].white = source.white;
+
+    if (fadeOut) {
+      const float fadeProgress = static_cast<float>(second) / 60.0f;
+      const float remainingRatio = 1.0f - fadeProgress;
+      const uint8_t fadedMaster = static_cast<uint8_t>(lroundf(static_cast<float>(source.master) * remainingRatio));
+      fixtures[i].master = fadedMaster;
+    } else {
+      fixtures[i].master = source.master;
+    }
   }
 
   updateSelectedFixtureState();
@@ -1110,7 +1085,6 @@ void handleWifiSave() {
 
   String json = "{\"ok\":true,\"message\":\"保存しました。接続を試しています。\",\"ssid\":\"" + jsonEscape(ssid) + "\"}";
   server.send(200, "application/json; charset=utf-8", json);
-  delay(10);
 }
 
 void handleWifiSaved() {
@@ -2931,7 +2905,6 @@ void maintainWiFi() {
 
 void setup() {
   Serial.begin(115200);
-  delay(500);
 
   Serial.println();
   Serial.println("Paludarium DMX controller starting...");
@@ -3004,6 +2977,4 @@ void loop() {
     lastLightMs = now;
     updateAutomaticLight();
   }
-
-  delay(1);
 }
