@@ -2900,6 +2900,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
             alert(data.error || 'AUTO設定の保存に失敗しました');
             return;
           }
+          alert('AUTO設定を保存しました');
           updateStatus();
         });
     }
